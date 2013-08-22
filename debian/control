@@ -1,0 +1,14 @@
+Source: leap-mail
+Maintainer: Micah Anderson <micah@leap.se>
+Section: python
+Priority: optional
+Build-Depends: python-setuptools (>= 0.6b3), python-all (>= 2.6.6-3), debhelper (>= 9)
+Standards-Version: 3.9.4
+
+Package: leap-mail
+Architecture: all
+Depends: ${misc:Depends}, ${python:Depends}
+Suggests: bitmask
+Description: Client-side python bindings for the LEAP mail client
+ This package contains the client-side python components for interacting with bitmask,
+ and the server-side leap_mx.
