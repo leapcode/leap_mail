@@ -1,4 +1,11 @@
-leap-mail (0.3.1pre) unstable; urgency=low
+leap-mail (0.3.1) unstable; urgency=low
+
+  * Update to 0.3.1 release.
+  * Add leap.common to pydist-overrides.
+
+ -- Ben Carrillo <ben@futeisha.org>  Tue, 27 Aug 2013 11:50:38 +0200
+
+leap-mail (0.3.1~pre) unstable; urgency=low
 
   * Initial import
 
