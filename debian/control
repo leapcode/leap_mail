@@ -10,5 +10,5 @@ Architecture: all
 Depends: ${misc:Depends}, ${python:Depends}
 Suggests: bitmask
 Description: Client-side python bindings for the LEAP mail client
- This package contains the client-side python components for interacting with bitmask,
- and the server-side leap_mx.
+ This package contains the client-side python components for interacting with
+ bitmask, and the server-side leap_mx.
