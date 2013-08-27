@@ -4,6 +4,7 @@ leap-mail (0.3.1) unstable; urgency=low
   * Add leap.common to pydist-overrides.
   * Update debian/control extended description to fit length
   * Add debian/copyright
+  * Install CHANGELOG.
 
  -- Micah Anderson <micah@leap.se>  Tue, 27 Aug 2013 11:50:38 +0200
 
