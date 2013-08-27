@@ -3,6 +3,7 @@ leap-mail (0.3.1) unstable; urgency=low
   * Update to 0.3.1 release.
   * Add leap.common to pydist-overrides.
   * Update debian/control extended description to fit length
+  * Add debian/copyright
 
  -- Micah Anderson <micah@leap.se>  Tue, 27 Aug 2013 11:50:38 +0200
 
