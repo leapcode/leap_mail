@@ -9,6 +9,7 @@ Package: leap-mail
 Architecture: all
 Depends: ${misc:Depends}, ${python:Depends}
 Suggests: bitmask
-Description: Client-side python bindings for the LEAP mail client
- This package contains the client-side python components for interacting with
- bitmask, and the server-side leap_mx.
+Description: Mail Services provided by Bitmask, the LEAP Client.
+ This package contains the client-side python components that the desktop client uses 
+ for interacting with server-side leap_mx. It includes an SMTP proxy and a local
+ IMAP server that will fetch mail from the remote incoming queue backed up by SOLEDAD.

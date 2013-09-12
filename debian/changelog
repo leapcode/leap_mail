@@ -1,3 +1,9 @@
+leap-mail (0.3.2) unstable; urgency=low
+
+  * Update to 0.3.2 release.
+
+ -- Micah Anderson <micah@leap.se>  Thu, 12 Sep 2013 14:21:13 +0200
+
 leap-mail (0.3.1) unstable; urgency=low
 
   * Update to 0.3.1 release.
