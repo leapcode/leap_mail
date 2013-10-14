@@ -1,3 +1,9 @@
+leap-mail (0.3.4) unstable; urgency=low
+
+  * Update to 0.3.4 release.
+
+ -- Micah Anderson <micah@leap.se>  Mon, 14 Oct 2013 17:23:10 -0300
+
 leap-mail (0.3.3.1) unstable; urgency=low
 
   * Add python-leap.soledad.client and python-leap.keymanager to
