@@ -1,3 +1,10 @@
+leap-mail (0.3.3.1) unstable; urgency=low
+
+  * Add python-leap.soledad.client and python-leap.keymanager to
+    debian/pydist-overrides
+
+ -- Micah Anderson <micah@leap.se>  Tue, 24 Sep 2013 20:59:01 -0400
+
 leap-mail (0.3.3) unstable; urgency=low
 
   * Update to 0.3.3 release.

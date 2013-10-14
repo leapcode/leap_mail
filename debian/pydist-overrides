@@ -1,1 +1,3 @@
-leap.common python-leap-common (>=0.3.1)
+leap.soledad.client soledad-client ; PEP386
+leap.common python-leap-common ; PEP386
+leap.keymanager leap-keymanager
