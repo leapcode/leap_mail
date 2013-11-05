@@ -1,3 +1,9 @@
+leap-mail (0.3.6) unstable; urgency=low
+
+  * Update to 0.3.6 release.
+
+ -- Ben Carrillo <ben@futeisha.org>  Tue, 05 Nov 2013 11:34:59 -0200
+
 leap-mail (0.3.4) unstable; urgency=low
 
   * Update to 0.3.4 release.
