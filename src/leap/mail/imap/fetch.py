@@ -389,10 +389,12 @@ class LeapIncomingMail(object):
         # try to obtain sender public key
         senderPubkey = None
         fromHeader = msg.get('from', None)
-        if fromHeader is not None:
+        if fromHeader is not None \
+                and (msg.get_content_type() == 'multipart/encrypted' \
+                     or msg.get_content_type() == 'multipart/signed'):
             _, senderAddress = parseaddr(fromHeader)
             try:
-                senderPubkey = self._keymanager.get_key(
+                senderPubkey = self._keymanager.get_key_from_cache(
                     senderAddress, OpenPGPKey)
             except keymanager_errors.KeyNotFound:
                 pass
@@ -511,7 +513,7 @@ class LeapIncomingMail(object):
         if PGP_BEGIN in data:
             begin = data.find(PGP_BEGIN)
             end = data.find(PGP_END)
-            pgp_message = data[begin:end+len(PGP_END)]
+            pgp_message = data[begin:end + len(PGP_END)]
             try:
                 decrdata, valid_sig = self._decrypt_and_verify_data(
                     pgp_message, senderPubkey)
