@@ -1,3 +1,9 @@
+leap-mail (0.3.9~rc) unstable; urgency=low
+
+  * Update to 0.3.9 rc release 
+
+ -- Ben Carrillo <ben@futeisha.org>  Mon, 23 Dec 2013 02:13:53 -0400
+
 leap-mail (0.3.8) unstable; urgency=low
 
   * Update to 0.3.8 release
