@@ -7,7 +7,7 @@ Standards-Version: 3.9.5
 
 Package: leap-mail
 Architecture: all
-Depends: ${misc:Depends}, ${python:Depends}
+Depends: ${misc:Depends}, ${python:Depends}, python-twisted-core, python-twisted-mail
 Suggests: bitmask
 Description: Mail Services provided by Bitmask, the LEAP Client.
  This package contains the client-side python components that the desktop

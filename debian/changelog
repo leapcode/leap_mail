@@ -1,3 +1,9 @@
+leap-mail (0.3.9.1) unstable; urgency=medium
+
+  * Change twisted dependency for more specific sub-packages. 
+
+ -- Ben Carrillo <ben@futeisha.org>  Thu, 14 Aug 2014 11:24:06 -0500
+
 leap-mail (0.3.9) unstable; urgency=low
 
   * Update to 0.3.9 release 
