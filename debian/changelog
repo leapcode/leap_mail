@@ -1,3 +1,9 @@
+leap-mail (0.3.11ppa1) unstable; urgency=medium
+
+  * Rebuild for ppa 
+
+ -- Micah Anderson <micah@leap.se>  Tue, 13 Jan 2015 16:47:35 -0500
+
 leap-mail (0.3.11) unstable; urgency=medium
 
   * Update to 0.3.11 release. 
