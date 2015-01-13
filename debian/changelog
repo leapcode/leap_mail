@@ -1,8 +1,10 @@
-leap-mail (0.3.11ppa1) unstable; urgency=medium
+leap-mail (0.3.11.1ppa1) unstable; urgency=medium
 
+  * Update Standards version to 3.9.6 (no changes) 
+  * Update debian/copyright to fix space-in-std-shortname
   * Rebuild for ppa 
 
- -- Micah Anderson <micah@leap.se>  Tue, 13 Jan 2015 16:47:35 -0500
+ -- Micah Anderson <micah@leap.se>  Tue, 13 Jan 2015 16:49:11 -0500
 
 leap-mail (0.3.11) unstable; urgency=medium
 
