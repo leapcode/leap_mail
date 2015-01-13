@@ -1,6 +1,7 @@
 leap-mail (0.3.11.1) UNRELEASED; urgency=medium
 
   * Update Standards version to 3.9.6 (no changes) 
+  * Update debian/copyright to fix space-in-std-shortname
 
  -- Micah Anderson <micah@leap.se>  Tue, 13 Jan 2015 16:49:11 -0500
 
