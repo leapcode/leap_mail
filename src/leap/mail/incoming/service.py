@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# fetch.py
-# Copyright (C) 2013 LEAP
+# service.py
+# Copyright (C) 2015 LEAP
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,7 +20,6 @@ Incoming mail fetcher.
 import copy
 import logging
 import shlex
-import threading
 import time
 import traceback
 import warnings
@@ -31,12 +30,12 @@ from email.utils import parseaddr
 from StringIO import StringIO
 from urlparse import urlparse
 
+from twisted.application.service import Service
 from twisted.python import log
 from twisted.internet import defer, reactor
 from twisted.internet.task import LoopingCall
 from twisted.internet.task import deferLater
 from u1db import errors as u1db_errors
-from zope.proxy import sameProxiedObjects
 
 from leap.common import events as leap_events
 from leap.common.check import leap_assert, leap_assert_type
@@ -50,8 +49,7 @@ from leap.common.events.events_pb2 import SOLEDAD_INVALID_AUTH_TOKEN
 from leap.common.mail import get_email_charset
 from leap.keymanager import errors as keymanager_errors
 from leap.keymanager.openpgp import OpenPGPKey
-from leap.mail.decorators import deferred_to_thread
-from leap.mail.imap.fields import fields
+from leap.mail.adaptors import soledad_indexes as fields
 from leap.mail.utils import json_loads, empty, first
 from leap.soledad.client import Soledad
 from leap.soledad.common.crypto import ENC_SCHEME_KEY, ENC_JSON_KEY
@@ -65,6 +63,10 @@ MULTIPART_SIGNED = "multipart/signed"
 PGP_BEGIN = "-----BEGIN PGP MESSAGE-----"
 PGP_END = "-----END PGP MESSAGE-----"
 
+# The period between succesive checks of the incoming mail
+# queue (in seconds)
+INCOMING_CHECK_PERIOD = 60
+
 
 class MalformedMessage(Exception):
     """
@@ -73,18 +75,22 @@ class MalformedMessage(Exception):
     pass
 
 
-class LeapIncomingMail(object):
+class IncomingMail(Service):
     """
     Fetches and process mail from the incoming pool.
 
-    This object has public methods start_loop and stop that will
-    actually initiate a LoopingCall with check_period recurrency.
+    This object implements IService interface, has public methods
+    startService and stopService that will actually initiate a
+    LoopingCall with check_period recurrency.
     The LoopingCall itself will invoke the fetch method each time
     that the check_period expires.
 
     This loop will sync the soledad db with the remote server and
     process all the documents found tagged as incoming mail.
     """
+    # TODO implements IService?
+
+    name = "IncomingMail"
 
     RECENT_FLAG = "\\Recent"
     CONTENT_KEY = "content"
@@ -99,13 +105,11 @@ class LeapIncomingMail(object):
     LEAP_SIGNATURE_INVALID = 'invalid'
     LEAP_SIGNATURE_COULD_NOT_VERIFY = 'could not verify'
 
-    fetching_lock = threading.Lock()
-
-    def __init__(self, keymanager, soledad, imap_account,
-                 check_period, userid):
+    def __init__(self, keymanager, soledad, inbox, userid,
+                 check_period=INCOMING_CHECK_PERIOD):
 
         """
-        Initialize LeapIncomingMail..
+        Initialize IncomingMail..
 
         :param keymanager: a keymanager instance
         :type keymanager: keymanager.KeyManager
@@ -113,8 +117,8 @@ class LeapIncomingMail(object):
         :param soledad: a soledad instance
         :type soledad: Soledad
 
-        :param imap_account: the account to fetch periodically
-        :type imap_account: SoledadBackedAccount
+        :param inbox: the inbox where the new emails will be stored
+        :type inbox: IMAPMailbox
 
         :param check_period: the period to fetch new mail, in seconds.
         :type check_period: int
@@ -128,8 +132,7 @@ class LeapIncomingMail(object):
 
         self._keymanager = keymanager
         self._soledad = soledad
-        self.imapAccount = imap_account
-        self._inbox = self.imapAccount.getMailbox('inbox')
+        self._inbox = inbox
         self._userid = userid
 
         self._loop = None
@@ -137,13 +140,6 @@ class LeapIncomingMail(object):
 
         # initialize a mail parser only once
         self._parser = Parser()
-
-    @property
-    def _pkey(self):
-        if sameProxiedObjects(self._keymanager, None):
-            logger.warning('tried to get key, but null keymanager found')
-            return None
-        return self._keymanager.get_key(self._userid, OpenPGPKey, private=True)
 
     #
     # Public API: fetch, start_loop, stop.
@@ -156,51 +152,49 @@ class LeapIncomingMail(object):
         Calls a deferred that will execute the fetch callback
         in a separate thread
         """
-        def syncSoledadCallback(result):
-            # FIXME this needs a matching change in mx!!!
-            # --> need to add ERROR_DECRYPTING_KEY = False
-            # as default.
-            try:
-                doclist = self._soledad.get_from_index(
-                    fields.JUST_MAIL_IDX, "*", "0")
-            except u1db_errors.InvalidGlobbing:
+        def mail_compat(failure):
+            if failure.check(u1db_errors.InvalidGlobbing):
                 # It looks like we are a dealing with an outdated
                 # mx. Fallback to the version of the index
                 warnings.warn("JUST_MAIL_COMPAT_IDX will be deprecated!",
                               DeprecationWarning)
-                doclist = self._soledad.get_from_index(
+                return self._soledad.get_from_index(
                     fields.JUST_MAIL_COMPAT_IDX, "*")
-            return self._process_doclist(doclist)
+            return failure
+
+        def syncSoledadCallback(_):
+            d = self._soledad.get_from_index(
+                fields.JUST_MAIL_IDX, "*", "0")
+            d.addErrback(mail_compat)
+            d.addCallback(self._process_doclist)
+            return d
 
         logger.debug("fetching mail for: %s %s" % (
             self._soledad.uuid, self._userid))
-        if not self.fetching_lock.locked():
-            d1 = self._sync_soledad()
-            d = defer.gatherResults([d1], consumeErrors=True)
-            d.addCallbacks(syncSoledadCallback, self._errback)
-            d.addCallbacks(self._signal_fetch_to_ui, self._errback)
-            return d
-        else:
-            logger.debug("Already fetching mail.")
+        d = self._sync_soledad()
+        d.addCallbacks(syncSoledadCallback, self._errback)
+        d.addCallbacks(self._signal_fetch_to_ui, self._errback)
+        return d
 
-    def start_loop(self):
+    def startService(self):
         """
         Starts a loop to fetch mail.
         """
+        Service.startService(self)
         if self._loop is None:
             self._loop = LoopingCall(self.fetch)
-            self._loop.start(self._check_period)
+            return self._loop.start(self._check_period)
         else:
             logger.warning("Tried to start an already running fetching loop.")
 
-    def stop(self):
-        # XXX change the name to stop_loop, for consistency.
+    def stopService(self):
         """
         Stops the loop that fetches mail.
         """
         if self._loop and self._loop.running is True:
             self._loop.stop()
             self._loop = None
+        Service.stopService(self)
 
     #
     # Private methods.
@@ -212,7 +206,6 @@ class LeapIncomingMail(object):
         logger.exception(failure.value)
         traceback.print_exc()
 
-    @deferred_to_thread
     def _sync_soledad(self):
         """
         Synchronize with remote soledad.
@@ -220,15 +213,21 @@ class LeapIncomingMail(object):
         :returns: a list of LeapDocuments, or None.
         :rtype: iterable or None
         """
-        with self.fetching_lock:
-            try:
-                log.msg('FETCH: syncing soledad...')
-                self._soledad.sync()
-                log.msg('FETCH soledad SYNCED.')
-            except InvalidAuthTokenError:
-                # if the token is invalid, send an event so the GUI can
-                # disable mail and show an error message.
-                leap_events.signal(SOLEDAD_INVALID_AUTH_TOKEN)
+        def _log_synced(result):
+            log.msg('FETCH soledad SYNCED.')
+            print "Result: ", result
+            return result
+        try:
+            log.msg('FETCH: syncing soledad...')
+            d = self._soledad.sync()
+            d.addCallback(_log_synced)
+            return d
+        # TODO is this still raised? or should we do failure.trap
+        # instead?
+        except InvalidAuthTokenError:
+            # if the token is invalid, send an event so the GUI can
+            # disable mail and show an error message.
+            leap_events.signal(SOLEDAD_INVALID_AUTH_TOKEN)
 
     def _signal_fetch_to_ui(self, doclist):
         """
@@ -304,7 +303,6 @@ class LeapIncomingMail(object):
     # operations on individual messages
     #
 
-    @deferred_to_thread
     def _decrypt_doc(self, doc):
         """
         Decrypt the contents of a document.
@@ -312,40 +310,46 @@ class LeapIncomingMail(object):
         :param doc: A document containing an encrypted message.
         :type doc: SoledadDocument
 
-        :return: A tuple containing the document and the decrypted message.
-        :rtype: (SoledadDocument, str)
+        :return: A Deferred that will be fired with the document and the
+                 decrypted message.
+        :rtype: SoledadDocument, str
         """
         log.msg('decrypting msg')
-        success = False
 
-        try:
-            decrdata = self._keymanager.decrypt(
-                doc.content[ENC_JSON_KEY],
-                self._pkey)
-            success = True
-        except Exception as exc:
-            # XXX move this to errback !!!
-            logger.error("Error while decrypting msg: %r" % (exc,))
-            decrdata = ""
-        leap_events.signal(IMAP_MSG_DECRYPTED, "1" if success else "0")
+        def process_decrypted(res):
+            if isinstance(res, tuple):
+                decrdata, _ = res
+                success = True
+            else:
+                decrdata = ""
+                success = False
 
-        data = self._process_decrypted_doc((doc, decrdata))
-        return (doc, data)
+            leap_events.signal(IMAP_MSG_DECRYPTED, "1" if success else "0")
+            return self._process_decrypted_doc(doc, decrdata)
 
-    def _process_decrypted_doc(self, msgtuple):
+        d = self._keymanager.decrypt(
+            doc.content[ENC_JSON_KEY],
+            self._userid, OpenPGPKey)
+        d.addErrback(self._errback)
+        d.addCallback(process_decrypted)
+        d.addCallback(lambda data: (doc, data))
+        return d
+
+    def _process_decrypted_doc(self, doc, data):
         """
         Process a document containing a succesfully decrypted message.
 
-        :param msgtuple: a tuple consisting of a SoledadDocument
-                         instance containing the incoming message
-                         and data, the json-encoded, decrypted content of the
-                         incoming message
-        :type msgtuple: (SoledadDocument, str)
-        :return: the processed data.
-        :rtype: str
+        :param doc: the incoming message
+        :type doc: SoledadDocument
+        :param data: the json-encoded, decrypted content of the incoming
+                     message
+        :type data: str
+
+        :return: a Deferred that will be fired with an str of the proccessed
+                 data.
+        :rtype: Deferred
         """
         log.msg('processing decrypted doc')
-        doc, data = msgtuple
 
         # XXX turn this into an errBack for each one of
         # the deferreds that would process an individual document
@@ -381,7 +385,6 @@ class LeapIncomingMail(object):
             return ""
         return self._maybe_decrypt_msg(rawmsg)
 
-    @deferred_to_thread
     def _update_incoming_message(self, doc):
         """
         Do a put for a soledad document. This probably has been called only
@@ -391,10 +394,9 @@ class LeapIncomingMail(object):
         :param doc: the SoledadDocument to update
         :type doc: SoledadDocument
         """
-        log.msg("Updating SoledadDoc %s" % (doc.doc_id))
-        self._soledad.put_doc(doc)
+        log.msg("Updating Incoming MSG: SoledadDoc %s" % (doc.doc_id))
+        return self._soledad.put_doc(doc)
 
-    @deferred_to_thread
     def _delete_incoming_message(self, doc):
         """
         Delete document.
@@ -402,8 +404,9 @@ class LeapIncomingMail(object):
         :param doc: the SoledadDocument to delete
         :type doc: SoledadDocument
         """
+        print "DELETING INCOMING MESSAGE"
         log.msg("Deleting Incoming message: %s" % (doc.doc_id,))
-        self._soledad.delete_doc(doc)
+        return self._soledad.delete_doc(doc)
 
     def _maybe_decrypt_msg(self, data):
         """
@@ -411,8 +414,10 @@ class LeapIncomingMail(object):
 
         :param data: the text to be decrypted.
         :type data: str
-        :return: data, possibly decrypted.
-        :rtype: str
+
+        :return: a Deferred that will be fired with an str of data, possibly
+                 decrypted.
+        :rtype: Deferred
         """
         leap_assert_type(data, str)
         log.msg('maybe decrypting doc')
@@ -421,45 +426,41 @@ class LeapIncomingMail(object):
         encoding = get_email_charset(data)
         msg = self._parser.parsestr(data)
 
-        # try to obtain sender public key
-        senderPubkey = None
         fromHeader = msg.get('from', None)
+        senderAddress = None
         if (fromHeader is not None
             and (msg.get_content_type() == MULTIPART_ENCRYPTED
                  or msg.get_content_type() == MULTIPART_SIGNED)):
-            _, senderAddress = parseaddr(fromHeader)
-            try:
-                senderPubkey = self._keymanager.get_key(
-                    senderAddress, OpenPGPKey)
-            except keymanager_errors.KeyNotFound:
-                pass
+                senderAddress = parseaddr(fromHeader)
 
-        valid_sig = False  # we will add a header saying if sig is valid
-        decrypt_multi = self._decrypt_multipart_encrypted_msg
-        decrypt_inline = self._maybe_decrypt_inline_encrypted_msg
+        def add_leap_header(ret):
+            decrmsg, signkey = ret
+            if (senderAddress is None or
+                    isinstance(signkey, keymanager_errors.KeyNotFound)):
+                decrmsg.add_header(
+                    self.LEAP_SIGNATURE_HEADER,
+                    self.LEAP_SIGNATURE_COULD_NOT_VERIFY)
+            elif isinstance(signkey, keymanager_errors.InvalidSignature):
+                decrmsg.add_header(
+                    self.LEAP_SIGNATURE_HEADER,
+                    self.LEAP_SIGNATURE_INVALID)
+            else:
+                decrmsg.add_header(
+                    self.LEAP_SIGNATURE_HEADER,
+                    self.LEAP_SIGNATURE_VALID,
+                    pubkey=signkey.key_id)
+            return decrmsg.as_string()
 
         if msg.get_content_type() == MULTIPART_ENCRYPTED:
-            decrmsg, valid_sig = decrypt_multi(
-                msg, encoding, senderPubkey)
+            d = self._decrypt_multipart_encrypted_msg(
+                msg, encoding, senderAddress)
         else:
-            decrmsg, valid_sig = decrypt_inline(
-                msg, encoding, senderPubkey)
+            d = self._maybe_decrypt_inline_encrypted_msg(
+                msg, encoding, senderAddress)
+        d.addCallback(add_leap_header)
+        return d
 
-        # add x-leap-signature header
-        if senderPubkey is None:
-            decrmsg.add_header(
-                self.LEAP_SIGNATURE_HEADER,
-                self.LEAP_SIGNATURE_COULD_NOT_VERIFY)
-        else:
-            decrmsg.add_header(
-                self.LEAP_SIGNATURE_HEADER,
-                self.LEAP_SIGNATURE_VALID if valid_sig else
-                self.LEAP_SIGNATURE_INVALID,
-                pubkey=senderPubkey.key_id)
-
-        return decrmsg.as_string()
-
-    def _decrypt_multipart_encrypted_msg(self, msg, encoding, senderPubkey):
+    def _decrypt_multipart_encrypted_msg(self, msg, encoding, senderAddress):
         """
         Decrypt a message with content-type 'multipart/encrypted'.
 
@@ -467,12 +468,13 @@ class LeapIncomingMail(object):
         :type msg: Message
         :param encoding: The encoding of the email message.
         :type encoding: str
-        :param senderPubkey: The key of the sender of the message.
-        :type senderPubkey: OpenPGPKey
+        :param senderAddress: The email address of the sender of the message.
+        :type senderAddress: str
 
-        :return: A tuple containing a decrypted message and
-                 a bool indicating whether the signature is valid.
-        :rtype: (Message, bool)
+        :return: A Deferred that will be fired with a tuple containing a
+                 decrypted Message and the signing OpenPGPKey if the signature
+                 is valid or InvalidSignature or KeyNotFound.
+        :rtype: Deferred
         """
         log.msg('decrypting multipart encrypted msg')
         msg = copy.deepcopy(msg)
@@ -483,33 +485,33 @@ class LeapIncomingMail(object):
         encdata = pgpencmsg.get_payload()
 
         # decrypt or fail gracefully
-        try:
-            decrdata, valid_sig = self._decrypt_and_verify_data(
-                encdata, senderPubkey)
-        except keymanager_errors.DecryptError as e:
-            logger.warning('Failed to decrypt encrypted message (%s). '
-                           'Storing message without modifications.' % str(e))
-            # Bailing out!
-            return (msg, False)
+        def build_msg(res):
+            decrdata, signkey = res
 
-        decrmsg = self._parser.parsestr(decrdata)
-        # remove original message's multipart/encrypted content-type
-        del(msg['content-type'])
+            decrmsg = self._parser.parsestr(decrdata)
+            # remove original message's multipart/encrypted content-type
+            del(msg['content-type'])
 
-        # replace headers back in original message
-        for hkey, hval in decrmsg.items():
-            try:
-                # this will raise KeyError if header is not present
-                msg.replace_header(hkey, hval)
-            except KeyError:
-                msg[hkey] = hval
+            # replace headers back in original message
+            for hkey, hval in decrmsg.items():
+                try:
+                    # this will raise KeyError if header is not present
+                    msg.replace_header(hkey, hval)
+                except KeyError:
+                    msg[hkey] = hval
 
-        # all ok, replace payload by unencrypted payload
-        msg.set_payload(decrmsg.get_payload())
-        return (msg, valid_sig)
+            # all ok, replace payload by unencrypted payload
+            msg.set_payload(decrmsg.get_payload())
+            return (msg, signkey)
+
+        d = self._keymanager.decrypt(
+            encdata, self._userid, OpenPGPKey,
+            verify=senderAddress)
+        d.addCallbacks(build_msg, self._decryption_error, errbackArgs=(msg,))
+        return d
 
     def _maybe_decrypt_inline_encrypted_msg(self, origmsg, encoding,
-                                            senderPubkey):
+                                            senderAddress):
         """
         Possibly decrypt an inline OpenPGP encrypted message.
 
@@ -517,12 +519,13 @@ class LeapIncomingMail(object):
         :type origmsg: Message
         :param encoding: The encoding of the email message.
         :type encoding: str
-        :param senderPubkey: The key of the sender of the message.
-        :type senderPubkey: OpenPGPKey
+        :param senderAddress: The email address of the sender of the message.
+        :type senderAddress: str
 
-        :return: A tuple containing a decrypted message and
-                 a bool indicating whether the signature is valid.
-        :rtype: (Message, bool)
+        :return: A Deferred that will be fired with a tuple containing a
+                 decrypted Message and the signing OpenPGPKey if the signature
+                 is valid or InvalidSignature or KeyNotFound.
+        :rtype: Deferred
         """
         log.msg('maybe decrypting inline encrypted msg')
         # serialize the original message
@@ -530,54 +533,48 @@ class LeapIncomingMail(object):
         g = Generator(buf)
         g.flatten(origmsg)
         data = buf.getvalue()
+
+        def decrypted_data(res):
+            decrdata, signkey = res
+            return data.replace(pgp_message, decrdata), signkey
+
+        def encode_and_return(res):
+            data, signkey = res
+            if isinstance(data, unicode):
+                data = data.encode(encoding, 'replace')
+            return (self._parser.parsestr(data), signkey)
+
         # handle exactly one inline PGP message
-        valid_sig = False
         if PGP_BEGIN in data:
             begin = data.find(PGP_BEGIN)
             end = data.find(PGP_END)
             pgp_message = data[begin:end + len(PGP_END)]
-            try:
-                decrdata, valid_sig = self._decrypt_and_verify_data(
-                    pgp_message, senderPubkey)
-                # replace encrypted by decrypted content
-                data = data.replace(pgp_message, decrdata)
-            except keymanager_errors.DecryptError:
-                logger.warning('Failed to decrypt potential inline encrypted '
-                               'message. Storing message as is...')
+            d = self._keymanager.decrypt(
+                pgp_message, self._userid, OpenPGPKey,
+                verify=senderAddress)
+            d.addCallbacks(decrypted_data, self._decryption_error,
+                           errbackArgs=(data,))
+        else:
+            d = defer.succeed((data, None))
+        d.addCallback(encode_and_return)
+        return d
 
-        # if message is not encrypted, return raw data
-        if isinstance(data, unicode):
-            data = data.encode(encoding, 'replace')
-        return (self._parser.parsestr(data), valid_sig)
-
-    def _decrypt_and_verify_data(self, data, senderPubkey):
+    def _decryption_error(self, failure, msg):
         """
-        Decrypt C{data} using our private key and attempt to verify a
-        signature using C{senderPubkey}.
-
-        :param data: The text to be decrypted.
-        :type data: unicode
-        :param senderPubkey: The public key of the sender of the message.
-        :type senderPubkey: OpenPGPKey
-
-        :return: The decrypted data and a boolean stating whether the
-                 signature could be verified.
-        :rtype: (str, bool)
-
-        :raise DecryptError: Raised if failed to decrypt.
+        Check for known decryption errors
         """
-        log.msg('decrypting and verifying data')
-        valid_sig = False
-        try:
-            decrdata = self._keymanager.decrypt(
-                data, self._pkey,
-                verify=senderPubkey)
-            if senderPubkey is not None:
-                valid_sig = True
-        except keymanager_errors.InvalidSignature:
-            decrdata = self._keymanager.decrypt(
-                data, self._pkey)
-        return (decrdata, valid_sig)
+        if failure.check(keymanager_errors.DecryptError):
+            logger.warning('Failed to decrypt encrypted message (%s). '
+                           'Storing message without modifications.'
+                           % str(failure.value))
+            return (msg, None)
+        elif failure.check(keymanager_errors.KeyNotFound):
+            logger.error('Failed to find private key for decryption (%s). '
+                         'Storing message without modifications.'
+                         % str(failure.value))
+            return (msg, None)
+        else:
+            return failure
 
     def _extract_keys(self, msgtuple):
         """
@@ -592,6 +589,10 @@ class LeapIncomingMail(object):
                          and data, the json-encoded, decrypted content of the
                          incoming message
         :type msgtuple: (SoledadDocument, str)
+
+        :return: A Deferred that will be fired with msgtuple when key
+                 extraction finishes
+        :rtype: Deferred
         """
         OpenPGP_HEADER = 'OpenPGP'
         doc, data = msgtuple
@@ -603,13 +604,17 @@ class LeapIncomingMail(object):
         _, fromAddress = parseaddr(msg['from'])
 
         header = msg.get(OpenPGP_HEADER, None)
+        dh = defer.succeed(None)
         if header is not None:
-            self._extract_openpgp_header(header, fromAddress)
+            dh = self._extract_openpgp_header(header, fromAddress)
 
+        da = defer.succeed(None)
         if msg.is_multipart():
-            self._extract_attached_key(msg.get_payload(), fromAddress)
+            da = self._extract_attached_key(msg.get_payload(), fromAddress)
 
-        return msgtuple
+        d = defer.gatherResults([dh, da])
+        d.addCallback(lambda _: msgtuple)
+        return d
 
     def _extract_openpgp_header(self, header, address):
         """
@@ -619,7 +624,11 @@ class LeapIncomingMail(object):
         :type header: str
         :param address: email address in the from header
         :type address: str
+
+        :return: A Deferred that will be fired when header extraction is done
+        :rtype: Deferred
         """
+        d = defer.succeed(None)
         fields = dict([f.strip(' ').split('=') for f in header.split(';')])
         if 'url' in fields:
             url = shlex.split(fields['url'])[0]  # remove quotations
@@ -627,21 +636,28 @@ class LeapIncomingMail(object):
             addressHostname = address.split('@')[1]
             if (urlparts.scheme == 'https'
                     and urlparts.hostname == addressHostname):
-                try:
-                    self._keymanager.fetch_key(address, url, OpenPGPKey)
-                    logger.info("Imported key from header %s" % (url,))
-                except keymanager_errors.KeyNotFound:
-                    logger.warning("Url from OpenPGP header %s failed"
-                                   % (url,))
-                except keymanager_errors.KeyAttributesDiffer:
-                    logger.warning("Key from OpenPGP header url %s didn't "
-                                   "match the from address %s"
-                                   % (url, address))
+                def fetch_error(failure):
+                    if failure.check(keymanager_errors.KeyNotFound):
+                        logger.warning("Url from OpenPGP header %s failed"
+                                       % (url,))
+                    elif failure.check(keymanager_errors.KeyAttributesDiffer):
+                        logger.warning("Key from OpenPGP header url %s didn't "
+                                       "match the from address %s"
+                                       % (url, address))
+                    else:
+                        return failure
+
+                d = self._keymanager.fetch_key(address, url, OpenPGPKey)
+                d.addCallback(
+                    lambda _:
+                    logger.info("Imported key from header %s" % (url,)))
+                d.addErrback(fetch_error)
             else:
                 logger.debug("No valid url on OpenPGP header %s" % (url,))
         else:
             logger.debug("There is no url on the OpenPGP header: %s"
                          % (header,))
+        return d
 
     def _extract_attached_key(self, attachments, address):
         """
@@ -651,16 +667,22 @@ class LeapIncomingMail(object):
         :type attachments: list(email.Message)
         :param address: email address in the from header
         :type address: str
+
+        :return: A Deferred that will be fired when all the keys are stored
+        :rtype: Deferred
         """
         MIME_KEY = "application/pgp-keys"
 
+        deferreds = []
         for attachment in attachments:
             if MIME_KEY == attachment.get_content_type():
                 logger.debug("Add key from attachment")
-                self._keymanager.put_raw_key(
+                d = self._keymanager.put_raw_key(
                     attachment.get_payload(),
                     OpenPGPKey,
                     address=address)
+                deferreds.append(d)
+        return defer.gatherResults(deferreds)
 
     def _add_message_locally(self, msgtuple):
         """
@@ -672,24 +694,29 @@ class LeapIncomingMail(object):
                          and data, the json-encoded, decrypted content of the
                          incoming message
         :type msgtuple: (SoledadDocument, str)
+
+        :return: A Deferred that will be fired when the messages is stored
+        :rtype: Defferred
         """
         doc, data = msgtuple
         log.msg('adding message %s to local db' % (doc.doc_id,))
 
-        if isinstance(data, list):
-            if empty(data):
-                return False
-            data = data[0]
+        #if isinstance(data, list):
+            #if empty(data):
+                #return False
+            #data = data[0]
 
         def msgSavedCallback(result):
             if not empty(result):
                 leap_events.signal(IMAP_MSG_SAVED_LOCALLY)
-                deferLater(reactor, 0, self._delete_incoming_message, doc)
-                leap_events.signal(IMAP_MSG_DELETED_INCOMING)
+                print "DEFERRING THE DELETION ----->"
+                return self._delete_incoming_message(doc)
+                # TODO add notification as a callback
+                #leap_events.signal(IMAP_MSG_DELETED_INCOMING)
 
-        d = self._inbox.addMessage(data, flags=(self.RECENT_FLAG,),
-                                   notify_on_disk=True)
+        d = self._inbox.addMessage(data, (self.RECENT_FLAG,))
         d.addCallbacks(msgSavedCallback, self._errback)
+        return d
 
     #
     # helpers

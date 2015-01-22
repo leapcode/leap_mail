@@ -48,7 +48,6 @@ from leap.mail.smtp.rfc3156 import (
     RFC3156CompliantGenerator,
 )
 
-from leap.mail.service import OutgoingMail
 # replace email generator with a RFC 3156 compliant one.
 from email import generator
 
@@ -94,7 +93,7 @@ class SMTPFactory(ServerFactory):
                                mail or not.
         :type encrypted_only: bool
         :param outgoing_mail: The outgoing mail to send the message
-        :type outgoing_mail: leap.mail.service.OutgoingMail
+        :type outgoing_mail: leap.mail.outgoing.service.OutgoingMail
         """
 
         leap_assert_type(encrypted_only, bool)
@@ -142,7 +141,7 @@ class SMTPDelivery(object):
                                mail or not.
         :type encrypted_only: bool
         :param outgoing_mail: The outgoing mail to send the message
-        :type outgoing_mail: leap.mail.service.OutgoingMail
+        :type outgoing_mail: leap.mail.outgoing.service.OutgoingMail
         """
         self._userid = userid
         self._outgoing_mail = outgoing_mail
@@ -197,22 +196,31 @@ class SMTPDelivery(object):
             accepted.
         """
         # try to find recipient's public key
-        try:
-            address = validate_address(user.dest.addrstr)
-            # verify if recipient key is available in keyring
-            self._km.get_key(address, OpenPGPKey)  # might raise KeyNotFound
+        address = validate_address(user.dest.addrstr)
+
+        # verify if recipient key is available in keyring
+        def found(_):
             log.msg("Accepting mail for %s..." % user.dest.addrstr)
             signal(proto.SMTP_RECIPIENT_ACCEPTED_ENCRYPTED, user.dest.addrstr)
-        except KeyNotFound:
-            # if key was not found, check config to see if will send anyway.
-            if self._encrypted_only:
-                signal(proto.SMTP_RECIPIENT_REJECTED, user.dest.addrstr)
-                raise smtp.SMTPBadRcpt(user.dest.addrstr)
-            log.msg("Warning: will send an unencrypted message (because "
-                    "encrypted_only' is set to False).")
-            signal(
-                proto.SMTP_RECIPIENT_ACCEPTED_UNENCRYPTED, user.dest.addrstr)
-        return lambda: EncryptedMessage(user, self._outgoing_mail)
+
+        def not_found(failure):
+            if failure.check(KeyNotFound):
+                # if key was not found, check config to see if will send anyway
+                if self._encrypted_only:
+                    signal(proto.SMTP_RECIPIENT_REJECTED, user.dest.addrstr)
+                    raise smtp.SMTPBadRcpt(user.dest.addrstr)
+                log.msg("Warning: will send an unencrypted message (because "
+                        "encrypted_only' is set to False).")
+                signal(
+                    proto.SMTP_RECIPIENT_ACCEPTED_UNENCRYPTED,
+                    user.dest.addrstr)
+            else:
+                return failure
+
+        d = self._km.get_key(address, OpenPGPKey)  # might raise KeyNotFound
+        d.addCallbacks(found, not_found)
+        d.addCallback(lambda _: EncryptedMessage(user, self._outgoing_mail))
+        return d
 
     def validateFrom(self, helo, origin):
         """
@@ -258,7 +266,7 @@ class EncryptedMessage(object):
         :param user: The recipient of this message.
         :type user: twisted.mail.smtp.User
         :param outgoing_mail: The outgoing mail to send the message
-        :type outgoing_mail: leap.mail.service.OutgoingMail
+        :type outgoing_mail: leap.mail.outgoing.service.OutgoingMail
         """
         # assert params
         leap_assert_type(user, smtp.User)
@@ -298,4 +306,6 @@ class EncryptedMessage(object):
         log.err()
         signal(proto.SMTP_CONNECTION_LOST, self._user.dest.addrstr)
         # unexpected loss of connection; don't save
+
+
         self._lines = []
