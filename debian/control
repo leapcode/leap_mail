@@ -2,7 +2,7 @@ Source: leap-mail
 Maintainer: Micah Anderson <micah@leap.se>
 Section: python
 Priority: optional
-Build-Depends: python-setuptools (>= 0.6b3), python-all (>= 2.6.6-3), debhelper (>= 9)
+Build-Depends: python-setuptools (>= 0.6b3), python-all (>= 2.6.6-3), debhelper (>= 9), dh-python
 Standards-Version: 3.9.6
 
 Package: leap-mail
