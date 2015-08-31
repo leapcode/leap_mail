@@ -22,11 +22,12 @@ import logging
 
 from twisted.internet import reactor
 from twisted.internet.error import CannotListenError
+from leap.mail.outgoing.service import OutgoingMail
+
+from leap.common.events import emit, catalog
+from leap.mail.smtp.gateway import SMTPFactory
 
 logger = logging.getLogger(__name__)
-
-from leap.common.events import proto, signal
-from leap.mail.smtp.gateway import SMTPFactory
 
 
 def setup_smtp_gateway(port, userid, keymanager, smtp_host, smtp_port,
@@ -40,7 +41,7 @@ def setup_smtp_gateway(port, userid, keymanager, smtp_host, smtp_port,
     :param port: The port in which to run the server.
     :type port: int
     :param userid: The user currently logged in
-    :type userid: unicode
+    :type userid: str
     :param keymanager: A Key Manager from where to get recipients' public
                        keys.
     :type keymanager: leap.common.keymanager.KeyManager
@@ -59,16 +60,17 @@ def setup_smtp_gateway(port, userid, keymanager, smtp_host, smtp_port,
     :returns: tuple of SMTPFactory, twisted.internet.tcp.Port
     """
     # configure the use of this service with twistd
-    factory = SMTPFactory(userid, keymanager, smtp_host, smtp_port, smtp_cert,
-                          smtp_key, encrypted_only)
+    outgoing_mail = OutgoingMail(
+        userid, keymanager, smtp_cert, smtp_key, smtp_host, smtp_port)
+    factory = SMTPFactory(userid, keymanager, encrypted_only, outgoing_mail)
     try:
         tport = reactor.listenTCP(port, factory, interface="localhost")
-        signal(proto.SMTP_SERVICE_STARTED, str(port))
+        emit(catalog.SMTP_SERVICE_STARTED, str(port))
         return factory, tport
     except CannotListenError:
         logger.error("STMP Service failed to start: "
                      "cannot listen in port %s" % port)
-        signal(proto.SMTP_SERVICE_FAILED_TO_START, str(port))
+        emit(catalog.SMTP_SERVICE_FAILED_TO_START, str(port))
     except Exception as exc:
         logger.error("Unhandled error while launching smtp gateway service")
         logger.exception(exc)

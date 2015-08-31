@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # walk.py
-# Copyright (C) 2013 LEAP
+# Copyright (C) 2013-2015 LEAP
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,45 +26,60 @@ from leap.mail.utils import first
 DEBUG = os.environ.get("BITMASK_MAIL_DEBUG")
 
 if DEBUG:
-    get_hash = lambda s: sha256.SHA256(s).hexdigest()[:10]
+    def get_hash(s):
+        return sha256.SHA256(s).hexdigest()[:10]
 else:
-    get_hash = lambda s: sha256.SHA256(s).hexdigest()
+    def get_hash(s):
+        return sha256.SHA256(s).hexdigest()
 
 
 """
 Get interesting message parts
 """
-get_parts = lambda msg: [
-    {'multi': part.is_multipart(),
-     'ctype': part.get_content_type(),
-     'size': len(part.as_string()),
-     'parts': len(part.get_payload())
-        if isinstance(part.get_payload(), list)
-        else 1,
-     'headers': part.items(),
-     'phash': get_hash(part.get_payload())
-        if not part.is_multipart() else None}
-    for part in msg.walk()]
+
+
+def get_parts(msg):
+    return [
+        {
+            'multi': part.is_multipart(),
+            'ctype': part.get_content_type(),
+            'size': len(part.as_string()),
+            'parts':
+                len(part.get_payload())
+                if isinstance(part.get_payload(), list)
+                else 1,
+            'headers': part.items(),
+            'phash':
+                get_hash(part.get_payload())
+                if not part.is_multipart()
+                else None
+        } for part in msg.walk()]
 
 """
 Utility lambda functions for getting the parts vector and the
 payloads from the original message.
 """
 
-get_parts_vector = lambda parts: (x.get('parts', 1) for x in parts)
-get_payloads = lambda msg: ((x.get_payload(),
-                             dict(((str.lower(k), v) for k, v in (x.items()))))
-                            for x in msg.walk())
 
-get_body_phash_simple = lambda payloads: first(
-    [get_hash(payload) for payload, headers in payloads
-     if payloads])
+def get_parts_vector(parts):
+    return (x.get('parts', 1) for x in parts)
 
-get_body_phash_multi = lambda payloads: (first(
-    [get_hash(payload) for payload, headers in payloads
-     if payloads
-     and "text/plain" in headers.get('content-type', '')])
-    or get_body_phash_simple(payloads))
+
+def get_payloads(msg):
+    return ((x.get_payload(),
+            dict(((str.lower(k), v) for k, v in (x.items()))))
+            for x in msg.walk())
+
+
+def get_body_phash(msg):
+    """
+    Find the body payload-hash for this message.
+    """
+    for part in msg.walk():
+        # XXX what other ctypes should be considered body?
+        if part.get_content_type() in ("text/plain", "text/html"):
+            # XXX avoid hashing again
+            return get_hash(part.get_payload())
 
 """
 On getting the raw docs, we get also some of the headers to be able to
@@ -72,18 +87,51 @@ index the content. Here we remove any mutable part, as the the filename
 in the content disposition.
 """
 
-get_raw_docs = lambda msg, parts: (
-    {"type": "cnt",  # type content they'll be
-     "raw": payload if not DEBUG else payload[:100],
-     "phash": get_hash(payload),
-     "content-disposition": first(headers.get(
-         'content-disposition', '').split(';')),
-     "content-type": headers.get(
-         'content-type', ''),
-     "content-transfer-encoding": headers.get(
-         'content-transfer-type', '')}
-    for payload, headers in get_payloads(msg)
-    if not isinstance(payload, list))
+
+def get_raw_docs(msg, parts):
+    return (
+        {
+            "type": "cnt",  # type content they'll be
+            "raw": payload if not DEBUG else payload[:100],
+            "phash": get_hash(payload),
+            "content-disposition": first(headers.get(
+                'content-disposition', '').split(';')),
+            "content-type": headers.get(
+                'content-type', ''),
+            "content-transfer-encoding": headers.get(
+                'content-transfer-encoding', '')
+        } for payload, headers in get_payloads(msg)
+        if not isinstance(payload, list))
+
+
+"""
+Groucho Marx: Now pay particular attention to this first clause, because it's
+              most important. There's the party of the first part shall be
+              known in this contract as the party of the first part. How do you
+              like that, that's pretty neat eh?
+
+Chico Marx: No, that's no good.
+Groucho Marx: What's the matter with it?
+
+Chico Marx: I don't know, let's hear it again.
+Groucho Marx: So the party of the first part shall be known in this contract as
+              the party of the first part.
+
+Chico Marx: Well it sounds a little better this time.
+Groucho Marx: Well, it grows on you. Would you like to hear it once more?
+
+Chico Marx: Just the first part.
+Groucho Marx: All right. It says the first part of the party of the first part
+              shall be known in this contract as the first part of the party of
+              the first part, shall be known in this contract - look, why
+              should we quarrel about a thing like this, we'll take it right
+              out, eh?
+
+Chico Marx: Yes, it's too long anyhow. Now what have we got left?
+Groucho Marx: Well I've got about a foot and a half. Now what's the matter?
+
+Chico Marx: I don't like the second party either.
+"""
 
 
 def walk_msg_tree(parts, body_phash=None):
@@ -93,7 +141,7 @@ def walk_msg_tree(parts, body_phash=None):
     documents that will be stored in Soledad.
 
     It walks down the subparts in the parsed message tree, and collapses
-    the leaf docuents into a wrapper document until no multipart submessages
+    the leaf documents into a wrapper document until no multipart submessages
     are left. To achieve this, it iteratively calculates a wrapper vector of
     all documents in the sequence that have more than one part and have unitary
     documents to their right. To collapse a multipart, take as many
@@ -125,8 +173,12 @@ def walk_msg_tree(parts, body_phash=None):
         print
 
     # wrappers vector
-    getwv = lambda pv: [True if pv[i] != 1 and pv[i + 1] == 1 else False
-                        for i in range(len(pv) - 1)]
+    def getwv(pv):
+        return [
+            True if pv[i] != 1 and pv[i + 1] == 1
+            else False
+            for i in range(len(pv) - 1)
+        ]
     wv = getwv(pv)
 
     # do until no wrapper document is left
@@ -142,7 +194,7 @@ def walk_msg_tree(parts, body_phash=None):
             HEADERS: dict(parts[wind][HEADERS])
         }
 
-        # remove subparts and substitue wrapper
+        # remove subparts and substitute wrapper
         map(lambda i: parts.remove(i), slic)
         parts[wind] = cwra
 
@@ -157,12 +209,12 @@ def walk_msg_tree(parts, body_phash=None):
             last_part = max(main_pmap.keys())
             main_pmap[last_part][PART_MAP] = {}
             for partind in range(len(pv) - 1):
-                print partind+1, len(parts)
+                print partind + 1, len(parts)
                 main_pmap[last_part][PART_MAP][partind] = parts[partind + 1]
 
     outer = parts[0]
     outer.pop(HEADERS)
-    if not PART_MAP in outer:
+    if PART_MAP not in outer:
         # we have a multipart with 1 part only, so kind of fix it
         # although it would be prettier if I take this special case at
         # the beginning of the walk.
@@ -177,36 +229,3 @@ def walk_msg_tree(parts, body_phash=None):
         pdoc = outer
     pdoc[BODY] = body_phash
     return pdoc
-
-"""
-Groucho Marx: Now pay particular attention to this first clause, because it's
-              most important. There's the party of the first part shall be
-              known in this contract as the party of the first part. How do you
-              like that, that's pretty neat eh?
-
-Chico Marx: No, that's no good.
-Groucho Marx: What's the matter with it?
-
-Chico Marx: I don't know, let's hear it again.
-Groucho Marx: So the party of the first part shall be known in this contract as
-              the party of the first part.
-
-Chico Marx: Well it sounds a little better this time.
-Groucho Marx: Well, it grows on you. Would you like to hear it once more?
-
-Chico Marx: Just the first part.
-Groucho Marx: All right. It says the first part of the party of the first part
-              shall be known in this contract as the first part of the party of
-              the first part, shall be known in this contract - look, why
-              should we quarrel about a thing like this, we'll take it right
-              out, eh?
-
-Chico Marx: Yes, it's too long anyhow. Now what have we got left?
-Groucho Marx: Well I've got about a foot and a half. Now what's the matter?
-
-Chico Marx: I don't like the second party either.
-"""
-
-"""
-I feel you deserved it after reading the above and try to debug your problem ;)
-"""

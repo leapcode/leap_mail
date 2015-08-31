@@ -15,18 +15,19 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
-Leap IMAP4 Server Implementation.
+LEAP IMAP4 Server Implementation.
 """
+import StringIO
 from copy import copy
 
 from twisted import cred
+from twisted.internet import reactor
 from twisted.internet.defer import maybeDeferred
 from twisted.mail import imap4
 from twisted.python import log
 
-from leap.common import events as leap_events
 from leap.common.check import leap_assert, leap_assert_type
-from leap.common.events.events_pb2 import IMAP_CLIENT_LOGIN
+from leap.common.events import emit, catalog
 from leap.soledad.client import Soledad
 
 # imports for LITERAL+ patch
@@ -35,9 +36,41 @@ from twisted.mail.imap4 import IllegalClientResponse
 from twisted.mail.imap4 import LiteralString, LiteralFile
 
 
-class LeapIMAPServer(imap4.IMAP4Server):
+def _getContentType(msg):
     """
-    An IMAP4 Server with mailboxes backed by soledad
+    Return a two-tuple of the main and subtype of the given message.
+    """
+    attrs = None
+    mm = msg.getHeaders(False, 'content-type').get('content-type', None)
+    if mm:
+        mm = ''.join(mm.splitlines())
+        mimetype = mm.split(';')
+        if mimetype:
+            type = mimetype[0].split('/', 1)
+            if len(type) == 1:
+                major = type[0]
+                minor = None
+            elif len(type) == 2:
+                major, minor = type
+            else:
+                major = minor = None
+            # XXX patched ---------------------------------------------
+            attrs = dict(x.strip().split('=', 1) for x in mimetype[1:])
+            # XXX patched ---------------------------------------------
+        else:
+            major = minor = None
+    else:
+        major = minor = None
+    return major, minor, attrs
+
+# Monkey-patch _getContentType to avoid bug that passes lower-case boundary in
+# BODYSTRUCTURE response.
+imap4._getContentType = _getContentType
+
+
+class LEAPIMAPServer(imap4.IMAP4Server):
+    """
+    An IMAP4 Server with a LEAP Storage Backend.
     """
     def __init__(self, *args, **kwargs):
         # pop extraneous arguments
@@ -59,8 +92,87 @@ class LeapIMAPServer(imap4.IMAP4Server):
         # populate the test account properly (and only once
         # per session)
 
-        from twisted.internet import reactor
-        self.reactor = reactor
+    #############################################################
+    #
+    # Twisted imap4 patch to workaround bad mime rendering  in TB.
+    # See https://leap.se/code/issues/6773
+    # and https://bugzilla.mozilla.org/show_bug.cgi?id=149771
+    # Still unclear if this is a thunderbird bug.
+    # TODO send this patch upstream
+    #
+    #############################################################
+
+    def spew_body(self, part, id, msg, _w=None, _f=None):
+        if _w is None:
+            _w = self.transport.write
+        for p in part.part:
+            if msg.isMultipart():
+                msg = msg.getSubPart(p)
+            elif p > 0:
+                # Non-multipart messages have an implicit first part but no
+                # other parts - reject any request for any other part.
+                raise TypeError("Requested subpart of non-multipart message")
+
+        if part.header:
+            hdrs = msg.getHeaders(part.header.negate, *part.header.fields)
+            hdrs = imap4._formatHeaders(hdrs)
+            # PATCHED ##########################################
+            _w(str(part) + ' ' + imap4._literal(hdrs + "\r\n"))
+            # PATCHED ##########################################
+        elif part.text:
+            _w(str(part) + ' ')
+            _f()
+            return imap4.FileProducer(
+                msg.getBodyFile()
+            ).beginProducing(self.transport)
+        elif part.mime:
+            hdrs = imap4._formatHeaders(msg.getHeaders(True))
+
+            # PATCHED ##########################################
+            _w(str(part) + ' ' + imap4._literal(hdrs + "\r\n"))
+            # END PATCHED ######################################
+
+        elif part.empty:
+            _w(str(part) + ' ')
+            _f()
+            if part.part:
+                # PATCHED #############################################
+                # implement partial FETCH
+                # TODO implement boundary checks
+                # TODO see if there's a more efficient way, without
+                # copying the original content into a new buffer.
+                fd = msg.getBodyFile()
+                begin = getattr(part, "partialBegin", None)
+                _len = getattr(part, "partialLength", None)
+                if begin is not None and _len is not None:
+                    _fd = StringIO.StringIO()
+                    fd.seek(part.partialBegin)
+                    _fd.write(fd.read(part.partialLength))
+                    _fd.seek(0)
+                else:
+                    _fd = fd
+                return imap4.FileProducer(
+                    _fd
+                    # END PATCHED #########################3
+                ).beginProducing(self.transport)
+            else:
+                mf = imap4.IMessageFile(msg, None)
+                if mf is not None:
+                    return imap4.FileProducer(
+                        mf.open()).beginProducing(self.transport)
+                return imap4.MessageProducer(
+                    msg, None, self._scheduler).beginProducing(self.transport)
+
+        else:
+            _w('BODY ' +
+               imap4.collapseNestedLists([imap4.getBodyStructure(msg)]))
+
+    ##################################################################
+    #
+    # END Twisted imap4 patch to workaround bad mime rendering  in TB.
+    # #6773
+    #
+    ##################################################################
 
     def lineReceived(self, line):
         """
@@ -69,7 +181,7 @@ class LeapIMAPServer(imap4.IMAP4Server):
         :param line: the line from the server, without the line delimiter.
         :type line: str
         """
-        if self.theAccount.closed is True and self.state != "unauth":
+        if self.theAccount.session_ended is True and self.state != "unauth":
             log.msg("Closing the session. State: unauth")
             self.state = "unauth"
 
@@ -81,6 +193,20 @@ class LeapIMAPServer(imap4.IMAP4Server):
             msg = copy(line)
         log.msg('rcv (%s): %s' % (self.state, msg))
         imap4.IMAP4Server.lineReceived(self, line)
+
+    def close_server_connection(self):
+        """
+        Send a BYE command so that the MUA at least knows that we're closing
+        the connection.
+        """
+        self.sendLine(
+            '* BYE LEAP IMAP Proxy is shutting down; '
+            'so long and thanks for all the fish')
+        self.transport.loseConnection()
+        if self.mbox:
+            self.mbox.removeListener(self)
+            self.mbox = None
+        self.state = 'unauth'
 
     def authenticateLogin(self, username, password):
         """
@@ -98,7 +224,7 @@ class LeapIMAPServer(imap4.IMAP4Server):
             # bad username, reject.
             raise cred.error.UnauthorizedLogin()
         # any dummy password is allowed so far. use realm instead!
-        leap_events.signal(IMAP_CLIENT_LOGIN, "1")
+        emit(catalog.IMAP_CLIENT_LOGIN, "1")
         return imap4.IAccount, self.theAccount, lambda: None
 
     def do_FETCH(self, tag, messages, query, uid=0):
@@ -147,12 +273,15 @@ class LeapIMAPServer(imap4.IMAP4Server):
         """
         Notify new messages to listeners.
         """
-        self.reactor.callFromThread(self.mbox.notify_new)
+        reactor.callFromThread(self.mbox.notify_new)
 
     def _cbSelectWork(self, mbox, cmdName, tag):
         """
-        Callback for selectWork, patched to avoid conformance errors due to
-        incomplete UIDVALIDITY line.
+        Callback for selectWork
+
+        * patched to avoid conformance errors due to incomplete UIDVALIDITY
+        line.
+        * patched to accept deferreds for messagecount and recent count
         """
         if mbox is None:
             self.sendNegativeResponse(tag, 'No such mailbox')
@@ -161,10 +290,20 @@ class LeapIMAPServer(imap4.IMAP4Server):
             self.sendNegativeResponse(tag, 'Mailbox cannot be selected')
             return
 
+        d1 = defer.maybeDeferred(mbox.getMessageCount)
+        d2 = defer.maybeDeferred(mbox.getRecentCount)
+        return defer.gatherResults([d1, d2]).addCallback(
+            self.__cbSelectWork, mbox, cmdName, tag)
+
+    def __cbSelectWork(self, ((msg_count, recent_count)), mbox, cmdName, tag):
         flags = mbox.getFlags()
-        self.sendUntaggedResponse(str(mbox.getMessageCount()) + ' EXISTS')
-        self.sendUntaggedResponse(str(mbox.getRecentCount()) + ' RECENT')
         self.sendUntaggedResponse('FLAGS (%s)' % ' '.join(flags))
+
+        # Patched -------------------------------------------------------
+        # accept deferreds for the count
+        self.sendUntaggedResponse(str(msg_count) + ' EXISTS')
+        self.sendUntaggedResponse(str(recent_count) + ' RECENT')
+        # ----------------------------------------------------------------
 
         # Patched -------------------------------------------------------
         # imaptest was complaining about the incomplete line, we're adding
@@ -188,8 +327,7 @@ class LeapIMAPServer(imap4.IMAP4Server):
         a deferred, the client will only be informed of success (or failure)
         when the deferred's callback (or errback) is invoked.
         """
-        # TODO return the output of _memstore.is_writing
-        # XXX and that should return a deferred!
+        # TODO implement a collection of ongoing deferreds?
         return None
 
     #############################################################
@@ -311,21 +449,247 @@ class LeapIMAPServer(imap4.IMAP4Server):
         return self._fileLiteral(size, literalPlus)
         #############################
 
-    # Need to override the command table after patching
-    # arg_astring and arg_literal
+    # --------------------------------- isSubscribed patch
+    # TODO -- send patch upstream.
+    # There is a bug in twisted implementation:
+    # in cbListWork, it's assumed that account.isSubscribed IS a callable,
+    # although in the interface documentation it's stated that it can be
+    # a deferred.
 
+    def _listWork(self, tag, ref, mbox, sub, cmdName):
+        mbox = self._parseMbox(mbox)
+        mailboxes = maybeDeferred(self.account.listMailboxes, ref, mbox)
+        mailboxes.addCallback(self._cbSubscribed)
+        mailboxes.addCallback(
+            self._cbListWork, tag, sub, cmdName,
+        ).addErrback(self._ebListWork, tag)
+
+    def _cbSubscribed(self, mailboxes):
+        subscribed = [
+            maybeDeferred(self.account.isSubscribed, name)
+            for (name, box) in mailboxes]
+
+        def get_mailboxes_and_subs(result):
+            subscribed = [i[0] for i, yes in zip(mailboxes, result) if yes]
+            return mailboxes, subscribed
+
+        d = defer.gatherResults(subscribed)
+        d.addCallback(get_mailboxes_and_subs)
+        return d
+
+    def _cbListWork(self, mailboxes_subscribed, tag, sub, cmdName):
+        mailboxes, subscribed = mailboxes_subscribed
+
+        for (name, box) in mailboxes:
+            if not sub or name in subscribed:
+                flags = box.getFlags()
+                delim = box.getHierarchicalDelimiter()
+                resp = (imap4.DontQuoteMe(cmdName),
+                        map(imap4.DontQuoteMe, flags),
+                        delim, name.encode('imap4-utf-7'))
+                self.sendUntaggedResponse(
+                    imap4.collapseNestedLists(resp))
+        self.sendPositiveResponse(tag, '%s completed' % (cmdName,))
+    # -------------------- end isSubscribed patch -----------
+
+    # TODO subscribe method had also to be changed to accomodate deferred
+    def do_SUBSCRIBE(self, tag, name):
+        name = self._parseMbox(name)
+
+        def _subscribeCb(_):
+            self.sendPositiveResponse(tag, 'Subscribed')
+
+        def _subscribeEb(failure):
+            m = failure.value
+            log.err()
+            if failure.check(imap4.MailboxException):
+                self.sendNegativeResponse(tag, str(m))
+            else:
+                self.sendBadResponse(
+                    tag,
+                    "Server error encountered while subscribing to mailbox")
+
+        d = self.account.subscribe(name)
+        d.addCallbacks(_subscribeCb, _subscribeEb)
+        return d
+
+    auth_SUBSCRIBE = (do_SUBSCRIBE, arg_astring)
+    select_SUBSCRIBE = auth_SUBSCRIBE
+
+    def do_UNSUBSCRIBE(self, tag, name):
+        # unsubscribe method had also to be changed to accomodate
+        # deferred
+        name = self._parseMbox(name)
+
+        def _unsubscribeCb(_):
+            self.sendPositiveResponse(tag, 'Unsubscribed')
+
+        def _unsubscribeEb(failure):
+            m = failure.value
+            log.err()
+            if failure.check(imap4.MailboxException):
+                self.sendNegativeResponse(tag, str(m))
+            else:
+                self.sendBadResponse(
+                    tag,
+                    "Server error encountered while unsubscribing "
+                    "from mailbox")
+
+        d = self.account.unsubscribe(name)
+        d.addCallbacks(_unsubscribeCb, _unsubscribeEb)
+        return d
+
+    auth_UNSUBSCRIBE = (do_UNSUBSCRIBE, arg_astring)
+    select_UNSUBSCRIBE = auth_UNSUBSCRIBE
+
+    def do_RENAME(self, tag, oldname, newname):
+        oldname, newname = [self._parseMbox(n) for n in oldname, newname]
+        if oldname.lower() == 'inbox' or newname.lower() == 'inbox':
+            self.sendNegativeResponse(
+                tag,
+                'You cannot rename the inbox, or '
+                'rename another mailbox to inbox.')
+            return
+
+        def _renameCb(_):
+            self.sendPositiveResponse(tag, 'Mailbox renamed')
+
+        def _renameEb(failure):
+            m = failure.value
+            if failure.check(TypeError):
+                self.sendBadResponse(tag, 'Invalid command syntax')
+            elif failure.check(imap4.MailboxException):
+                self.sendNegativeResponse(tag, str(m))
+            else:
+                log.err()
+                self.sendBadResponse(
+                    tag,
+                    "Server error encountered while "
+                    "renaming mailbox")
+
+        d = self.account.rename(oldname, newname)
+        d.addCallbacks(_renameCb, _renameEb)
+        return d
+
+    auth_RENAME = (do_RENAME, arg_astring, arg_astring)
+    select_RENAME = auth_RENAME
+
+    def do_CREATE(self, tag, name):
+        name = self._parseMbox(name)
+
+        def _createCb(result):
+            if result:
+                self.sendPositiveResponse(tag, 'Mailbox created')
+            else:
+                self.sendNegativeResponse(tag, 'Mailbox not created')
+
+        def _createEb(failure):
+            c = failure.value
+            if failure.check(imap4.MailboxException):
+                self.sendNegativeResponse(tag, str(c))
+            else:
+                log.err()
+                self.sendBadResponse(
+                    tag, "Server error encountered while creating mailbox")
+
+        d = self.account.create(name)
+        d.addCallbacks(_createCb, _createEb)
+        return d
+
+    auth_CREATE = (do_CREATE, arg_astring)
+    select_CREATE = auth_CREATE
+
+    def do_DELETE(self, tag, name):
+        name = self._parseMbox(name)
+        if name.lower() == 'inbox':
+            self.sendNegativeResponse(tag, 'You cannot delete the inbox')
+            return
+
+        def _deleteCb(result):
+            self.sendPositiveResponse(tag, 'Mailbox deleted')
+
+        def _deleteEb(failure):
+            m = failure.value
+            if failure.check(imap4.MailboxException):
+                self.sendNegativeResponse(tag, str(m))
+            else:
+                print "SERVER: other error"
+                log.err()
+                self.sendBadResponse(
+                    tag,
+                    "Server error encountered while deleting mailbox")
+
+        d = self.account.delete(name)
+        d.addCallbacks(_deleteCb, _deleteEb)
+        return d
+
+    auth_DELETE = (do_DELETE, arg_astring)
+    select_DELETE = auth_DELETE
+
+    # -----------------------------------------------------------------------
+    # Patched just to allow __cbAppend to receive a deferred from messageCount
+    # TODO format and send upstream.
+    def do_APPEND(self, tag, mailbox, flags, date, message):
+        mailbox = self._parseMbox(mailbox)
+        maybeDeferred(self.account.select, mailbox).addCallback(
+            self._cbAppendGotMailbox, tag, flags, date, message).addErrback(
+            self._ebAppendGotMailbox, tag)
+
+    def __ebAppend(self, failure, tag):
+        self.sendBadResponse(tag, 'APPEND failed: ' + str(failure.value))
+
+    def _cbAppendGotMailbox(self, mbox, tag, flags, date, message):
+        if not mbox:
+            self.sendNegativeResponse(tag, '[TRYCREATE] No such mailbox')
+            return
+
+        d = mbox.addMessage(message, flags, date)
+        d.addCallback(self.__cbAppend, tag, mbox)
+        d.addErrback(self.__ebAppend, tag)
+
+    def _ebAppendGotMailbox(self, failure, tag):
+        self.sendBadResponse(
+            tag, "Server error encountered while opening mailbox.")
+        log.err(failure)
+
+    def __cbAppend(self, result, tag, mbox):
+
+        # XXX patched ---------------------------------
+        def send_response(count):
+            self.sendUntaggedResponse('%d EXISTS' % count)
+            self.sendPositiveResponse(tag, 'APPEND complete')
+
+        d = mbox.getMessageCount()
+        d.addCallback(send_response)
+        return d
+        # XXX patched ---------------------------------
+
+    # -----------------------------------------------------------------------
+
+    auth_APPEND = (do_APPEND, arg_astring, imap4.IMAP4Server.opt_plist,
+                   imap4.IMAP4Server.opt_datetime, arg_literal)
+    select_APPEND = auth_APPEND
+
+    # Need to override the command table after patching
+    # arg_astring and arg_literal, except on the methods that we are already
+    # overriding.
+
+    # TODO --------------------------------------------
+    # Check if we really need to override these
+    # methods, or we can monkeypatch.
+    # do_DELETE = imap4.IMAP4Server.do_DELETE
+    # do_CREATE = imap4.IMAP4Server.do_CREATE
+    # do_RENAME = imap4.IMAP4Server.do_RENAME
+    # do_SUBSCRIBE = imap4.IMAP4Server.do_SUBSCRIBE
+    # do_UNSUBSCRIBE = imap4.IMAP4Server.do_UNSUBSCRIBE
+    # do_APPEND = imap4.IMAP4Server.do_APPEND
+    # -------------------------------------------------
     do_LOGIN = imap4.IMAP4Server.do_LOGIN
-    do_CREATE = imap4.IMAP4Server.do_CREATE
-    do_DELETE = imap4.IMAP4Server.do_DELETE
-    do_RENAME = imap4.IMAP4Server.do_RENAME
-    do_SUBSCRIBE = imap4.IMAP4Server.do_SUBSCRIBE
-    do_UNSUBSCRIBE = imap4.IMAP4Server.do_UNSUBSCRIBE
     do_STATUS = imap4.IMAP4Server.do_STATUS
-    do_APPEND = imap4.IMAP4Server.do_APPEND
     do_COPY = imap4.IMAP4Server.do_COPY
 
     _selectWork = imap4.IMAP4Server._selectWork
-    _listWork = imap4.IMAP4Server._listWork
+
     arg_plist = imap4.IMAP4Server.arg_plist
     arg_seqset = imap4.IMAP4Server.arg_seqset
     opt_plist = imap4.IMAP4Server.opt_plist
@@ -342,8 +706,15 @@ class LeapIMAPServer(imap4.IMAP4Server):
     auth_EXAMINE = (_selectWork, arg_astring, 0, 'EXAMINE')
     select_EXAMINE = auth_EXAMINE
 
-    auth_DELETE = (do_DELETE, arg_astring)
-    select_DELETE = auth_DELETE
+    # TODO -----------------------------------------------
+    # re-add if we stop overriding DELETE
+    # auth_DELETE = (do_DELETE, arg_astring)
+    # select_DELETE = auth_DELETE
+    # auth_APPEND = (do_APPEND, arg_astring, opt_plist, opt_datetime,
+    #                arg_literal)
+    # select_APPEND = auth_APPEND
+
+    # ----------------------------------------------------
 
     auth_RENAME = (do_RENAME, arg_astring, arg_astring)
     select_RENAME = auth_RENAME
@@ -363,12 +734,7 @@ class LeapIMAPServer(imap4.IMAP4Server):
     auth_STATUS = (do_STATUS, arg_astring, arg_plist)
     select_STATUS = auth_STATUS
 
-    auth_APPEND = (do_APPEND, arg_astring, opt_plist, opt_datetime,
-                   arg_literal)
-    select_APPEND = auth_APPEND
-
     select_COPY = (do_COPY, arg_seqset, arg_astring)
-
 
     #############################################################
     # END of Twisted imap4 patch to support LITERAL+ extension

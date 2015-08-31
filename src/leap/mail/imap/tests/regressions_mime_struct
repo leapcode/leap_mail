@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # -*- coding: utf-8 -*-
-# regressions
+# regression_mime_struct
 # Copyright (C) 2014 LEAP
 # Copyright (c) Twisted Matrix Laboratories.
 #
@@ -18,7 +18,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
-Simple Regression Tests using IMAP4 client.
+Simple Regression Tests for checking MIME struct handling using IMAP4 client.
 
 Iterates trough all mails under a given folder and tries to APPEND them to
 the server being tested. After FETCHING the pushed message, it compares
@@ -40,7 +40,9 @@ from twisted.protocols import basic
 from twisted.python import log
 
 
-REGRESSIONS_FOLDER = "regressions_test"
+REGRESSIONS_FOLDER = os.environ.get(
+    "REGRESSIONS_FOLDER", "regressions_test")
+print "[+] Using regressions folder:", REGRESSIONS_FOLDER
 
 parser = Parser()
 
@@ -263,7 +265,7 @@ def cbSelectMbox(result, proto):
 
     if result["EXISTS"] != 0:
         # Flag as deleted, expunge, and do an examine again.
-        #print "There is mail here, will delete..."
+        print "There is mail here, will delete..."
         return cbDeleteAndExpungeTestFolder(proto)
 
     else:
@@ -276,9 +278,13 @@ def ebSelectMbox(failure, proto, folder):
 
     Creates the folder.
     """
-    print failure.getTraceback()
+    log.err(failure)
     log.msg("Folder %r does not exist. Creating..." % (folder,))
     return proto.create(folder).addCallback(cbAuthentication, proto)
+
+
+def ebExpunge(failure):
+    log.err(failure)
 
 
 def cbDeleteAndExpungeTestFolder(proto):
@@ -292,7 +298,9 @@ def cbDeleteAndExpungeTestFolder(proto):
     ).addCallback(
         lambda r: proto.expunge()
     ).addCallback(
-        cbExpunge, proto)
+        cbExpunge, proto
+    ).addErrback(
+        ebExpunge)
 
 
 def cbExpunge(result, proto):

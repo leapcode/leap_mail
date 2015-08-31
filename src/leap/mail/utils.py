@@ -17,12 +17,15 @@
 """
 Mail utilities.
 """
+from email.utils import parseaddr
 import json
 import re
 import traceback
 import Queue
 
 from leap.soledad.common.document import SoledadDocument
+from leap.common.check import leap_assert_type
+from twisted.mail import smtp
 
 
 CHARSET_PATTERN = r"""charset=([\w-]+)"""
@@ -42,9 +45,12 @@ def first(things):
 def empty(thing):
     """
     Return True if a thing is None or its length is zero.
+    If thing is a number (int, float, long), return False.
     """
     if thing is None:
         return True
+    if isinstance(thing, (int, float, long)):
+        return False
     if isinstance(thing, SoledadDocument):
         thing = thing.content
     try:
@@ -224,9 +230,30 @@ def accumulator_queue(fun, lim):
     return _accumulator
 
 
+def validate_address(address):
+    """
+    Validate C{address} as defined in RFC 2822.
+
+    :param address: The address to be validated.
+    :type address: str
+
+    @return: A valid address.
+    @rtype: str
+
+    @raise smtp.SMTPBadRcpt: Raised if C{address} is invalid.
+    """
+    leap_assert_type(address, str)
+    # in the following, the address is parsed as described in RFC 2822 and
+    # ('', '') is returned if the parse fails.
+    _, address = parseaddr(address)
+    if address == '':
+        raise smtp.SMTPBadRcpt(address)
+    return address
+
 #
 # String manipulation
 #
+
 
 class CustomJsonScanner(object):
     """
@@ -273,13 +300,13 @@ class CustomJsonScanner(object):
         end = s.find("\"", idx)
         while not found:
             try:
-                if s[end-1] != "\\":
+                if s[end - 1] != "\\":
                     found = True
                 else:
-                    end = s.find("\"", end+1)
+                    end = s.find("\"", end + 1)
             except Exception:
                 found = True
-        return s[idx:end].decode("string-escape"), end+1
+        return s[idx:end].decode("string-escape"), end + 1
 
     def __enter__(self):
         """
@@ -325,3 +352,24 @@ def json_loads(data):
         obj = json.loads(data, cls=json.JSONDecoder)
 
     return obj
+
+
+class CaseInsensitiveDict(dict):
+    """
+    A dictionary subclass that will allow case-insenstive key lookups.
+    """
+    def __init__(self, d=None):
+        if d is None:
+            d = []
+        if isinstance(d, dict):
+            for key, value in d.items():
+                self[key] = value
+        else:
+            for key, value in d:
+                self[key] = value
+
+    def __setitem__(self, key, value):
+        super(CaseInsensitiveDict, self).__setitem__(key.lower(), value)
+
+    def __getitem__(self, key):
+        return super(CaseInsensitiveDict, self).__getitem__(key.lower())
