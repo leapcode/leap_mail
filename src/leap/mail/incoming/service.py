@@ -21,7 +21,6 @@ import copy
 import logging
 import shlex
 import time
-import traceback
 import warnings
 
 from email.parser import Parser
@@ -33,18 +32,18 @@ from urlparse import urlparse
 
 from twisted.application.service import Service
 from twisted.python import log
+from twisted.python.failure import Failure
 from twisted.internet import defer, reactor
 from twisted.internet.task import LoopingCall
 from twisted.internet.task import deferLater
-from u1db import errors as u1db_errors
 
-from leap.common.events import emit, catalog
+from leap.common.events import emit_async, catalog
 from leap.common.check import leap_assert, leap_assert_type
 from leap.common.mail import get_email_charset
 from leap.keymanager import errors as keymanager_errors
 from leap.keymanager.openpgp import OpenPGPKey
 from leap.mail.adaptors import soledad_indexes as fields
-from leap.mail.utils import json_loads, empty, first
+from leap.mail.utils import json_loads, empty
 from leap.soledad.client import Soledad
 from leap.soledad.common.crypto import ENC_SCHEME_KEY, ENC_JSON_KEY
 from leap.soledad.common.errors import InvalidAuthTokenError
@@ -90,6 +89,7 @@ class IncomingMail(Service):
     CONTENT_KEY = "content"
 
     LEAP_SIGNATURE_HEADER = 'X-Leap-Signature'
+    LEAP_ENCRYPTION_HEADER = 'X-Leap-Encryption'
     """
     Header added to messages when they are decrypted by the fetcher,
     which states the validity of an eventual signature that might be included
@@ -98,6 +98,8 @@ class IncomingMail(Service):
     LEAP_SIGNATURE_VALID = 'valid'
     LEAP_SIGNATURE_INVALID = 'invalid'
     LEAP_SIGNATURE_COULD_NOT_VERIFY = 'could not verify'
+
+    LEAP_ENCRYPTION_DECRYPTED = 'decrypted'
 
     def __init__(self, keymanager, soledad, inbox, userid,
                  check_period=INCOMING_CHECK_PERIOD):
@@ -182,13 +184,21 @@ class IncomingMail(Service):
     def startService(self):
         """
         Starts a loop to fetch mail.
+
+        :returns: A Deferred whose callback will be invoked with
+                  the LoopingCall instance when loop.stop is called, or
+                  whose errback will be invoked when the function raises an
+                  exception or returned a deferred that has its errback
+                  invoked.
         """
         Service.startService(self)
         if self._loop is None:
             self._loop = LoopingCall(self.fetch)
-            return self._loop.start(self._check_period)
+            stop_deferred = self._loop.start(self._check_period)
+            return stop_deferred
         else:
             logger.warning("Tried to start an already running fetching loop.")
+            return defer.fail(Failure('Already running loop.'))
 
     def stopService(self):
         """
@@ -228,7 +238,7 @@ class IncomingMail(Service):
         except InvalidAuthTokenError:
             # if the token is invalid, send an event so the GUI can
             # disable mail and show an error message.
-            emit(catalog.SOLEDAD_INVALID_AUTH_TOKEN)
+            emit_async(catalog.SOLEDAD_INVALID_AUTH_TOKEN)
 
     def _signal_fetch_to_ui(self, doclist):
         """
@@ -244,16 +254,16 @@ class IncomingMail(Service):
             num_mails = len(doclist) if doclist is not None else 0
             if num_mails != 0:
                 log.msg("there are %s mails" % (num_mails,))
-            emit(catalog.MAIL_FETCHED_INCOMING,
-                 str(num_mails), str(fetched_ts))
+            emit_async(catalog.MAIL_FETCHED_INCOMING,
+                       str(num_mails), str(fetched_ts))
             return doclist
 
     def _signal_unread_to_ui(self, *args):
         """
         Sends unread event to ui.
         """
-        emit(catalog.MAIL_UNREAD_MESSAGES,
-             str(self._inbox_collection.count_unseen()))
+        emit_async(catalog.MAIL_UNREAD_MESSAGES,
+                   str(self._inbox_collection.count_unseen()))
 
     # process incoming mail.
 
@@ -276,8 +286,8 @@ class IncomingMail(Service):
         deferreds = []
         for index, doc in enumerate(doclist):
             logger.debug("processing doc %d of %d" % (index + 1, num_mails))
-            emit(catalog.MAIL_MSG_PROCESSING,
-                 str(index), str(num_mails))
+            emit_async(catalog.MAIL_MSG_PROCESSING,
+                       str(index), str(num_mails))
 
             keys = doc.content.keys()
 
@@ -294,7 +304,7 @@ class IncomingMail(Service):
                 logger.debug("skipping msg with decrypting errors...")
             elif self._is_msg(keys):
                 d = self._decrypt_doc(doc)
-                d.addCallback(self._extract_keys)
+                d.addCallback(self._maybe_extract_keys)
                 d.addCallbacks(self._add_message_locally, self._errback)
                 deferreds.append(d)
         d = defer.gatherResults(deferreds, consumeErrors=True)
@@ -326,7 +336,7 @@ class IncomingMail(Service):
                 decrdata = ""
                 success = False
 
-            emit(catalog.MAIL_MSG_DECRYPTED, "1" if success else "0")
+            emit_async(catalog.MAIL_MSG_DECRYPTED, "1" if success else "0")
             return self._process_decrypted_doc(doc, decrdata)
 
         d = self._keymanager.decrypt(
@@ -461,6 +471,10 @@ class IncomingMail(Service):
         d.addCallback(add_leap_header)
         return d
 
+    def _add_decrypted_header(self, msg):
+        msg.add_header(self.LEAP_ENCRYPTION_HEADER,
+                       self.LEAP_ENCRYPTION_DECRYPTED)
+
     def _decrypt_multipart_encrypted_msg(self, msg, encoding, senderAddress):
         """
         Decrypt a message with content-type 'multipart/encrypted'.
@@ -503,6 +517,7 @@ class IncomingMail(Service):
 
             # all ok, replace payload by unencrypted payload
             msg.set_payload(decrmsg.get_payload())
+            self._add_decrypted_header(msg)
             return (msg, signkey)
 
         d = self._keymanager.decrypt(
@@ -537,7 +552,9 @@ class IncomingMail(Service):
 
         def decrypted_data(res):
             decrdata, signkey = res
-            return data.replace(pgp_message, decrdata), signkey
+            replaced_data = data.replace(pgp_message, decrdata)
+            self._add_decrypted_header(origmsg)
+            return replaced_data, signkey
 
         def encode_and_return(res):
             data, signkey = res
@@ -577,7 +594,8 @@ class IncomingMail(Service):
         else:
             return failure
 
-    def _extract_keys(self, msgtuple):
+    @defer.inlineCallbacks
+    def _maybe_extract_keys(self, msgtuple):
         """
         Retrieve attached keys to the mesage and parse message headers for an
         *OpenPGP* header as described on the `IETF draft
@@ -604,20 +622,19 @@ class IncomingMail(Service):
         msg = self._parser.parsestr(data)
         _, fromAddress = parseaddr(msg['from'])
 
-        header = msg.get(OpenPGP_HEADER, None)
-        dh = defer.succeed(None)
-        if header is not None:
-            dh = self._extract_openpgp_header(header, fromAddress)
-
-        da = defer.succeed(None)
+        valid_attachment = False
         if msg.is_multipart():
-            da = self._extract_attached_key(msg.get_payload(), fromAddress)
+            valid_attachment = yield self._maybe_extract_attached_key(
+                msg.get_payload(), fromAddress)
 
-        d = defer.gatherResults([dh, da])
-        d.addCallback(lambda _: msgtuple)
-        return d
+        if not valid_attachment:
+            header = msg.get(OpenPGP_HEADER, None)
+            if header is not None:
+                yield self._maybe_extract_openpgp_header(header, fromAddress)
 
-    def _extract_openpgp_header(self, header, address):
+        defer.returnValue(msgtuple)
+
+    def _maybe_extract_openpgp_header(self, header, address):
         """
         Import keys from the OpenPGP header
 
@@ -662,7 +679,7 @@ class IncomingMail(Service):
                          % (header,))
         return d
 
-    def _extract_attached_key(self, attachments, address):
+    def _maybe_extract_attached_key(self, attachments, address):
         """
         Import keys from the attachments
 
@@ -672,20 +689,33 @@ class IncomingMail(Service):
         :type address: str
 
         :return: A Deferred that will be fired when all the keys are stored
+                 with a boolean: True if there was a valid key attached, or
+                 False otherwise.
         :rtype: Deferred
         """
         MIME_KEY = "application/pgp-keys"
 
+        def log_key_added(ignored):
+            logger.debug('Added key found in attachment for %s' % address)
+            return True
+
+        def failed_put_key(failure):
+            logger.info("An error has ocurred adding attached key for %s: %s"
+                        % (address, failure.getErrorMessage()))
+            return False
+
         deferreds = []
         for attachment in attachments:
             if MIME_KEY == attachment.get_content_type():
-                logger.debug("Add key from attachment")
                 d = self._keymanager.put_raw_key(
                     attachment.get_payload(),
                     OpenPGPKey,
                     address=address)
+                d.addCallbacks(log_key_added, failed_put_key)
                 deferreds.append(d)
-        return defer.gatherResults(deferreds)
+        d = defer.gatherResults(deferreds)
+        d.addCallback(lambda result: any(result))
+        return d
 
     def _add_message_locally(self, msgtuple):
         """
@@ -713,10 +743,10 @@ class IncomingMail(Service):
                 listener(result)
 
             def signal_deleted(doc_id):
-                emit(catalog.MAIL_MSG_DELETED_INCOMING)
+                emit_async(catalog.MAIL_MSG_DELETED_INCOMING)
                 return doc_id
 
-            emit(catalog.MAIL_MSG_SAVED_LOCALLY)
+            emit_async(catalog.MAIL_MSG_SAVED_LOCALLY)
             d = self._delete_incoming_message(doc)
             d.addCallback(signal_deleted)
             return d

@@ -215,11 +215,13 @@ class IMAPMailbox(object):
         but in the future will be useful to get absolute UIDs from
         message sequence numbers.
 
+
         :param message: the message sequence number.
         :type message: int
 
         :rtype: int
         :return: the UID of the message.
+
         """
         # TODO support relative sequences. The (imap) message should
         # receive a sequence number attribute: a deferred is not expected
@@ -558,7 +560,8 @@ class IMAPMailbox(object):
 
             def _get_imap_msg(messages):
                 d_imapmsg = []
-                for msg in messages:
+                # just in case we got bad data in here
+                for msg in filter(None, messages):
                     d_imapmsg.append(getimapmsg(msg))
                 return defer.gatherResults(d_imapmsg, consumeErrors=True)
 

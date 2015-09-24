@@ -37,14 +37,11 @@ from twisted.python import log
 
 from email.Header import Header
 from leap.common.check import leap_assert_type
-from leap.common.events import emit, catalog
+from leap.common.events import emit_async, catalog
 from leap.keymanager.openpgp import OpenPGPKey
 from leap.keymanager.errors import KeyNotFound
 from leap.mail.utils import validate_address
-
-from leap.mail.smtp.rfc3156 import (
-    RFC3156CompliantGenerator,
-)
+from leap.mail.rfc3156 import RFC3156CompliantGenerator
 
 # replace email generator with a RFC 3156 compliant one.
 from email import generator
@@ -204,18 +201,19 @@ class SMTPDelivery(object):
         # verify if recipient key is available in keyring
         def found(_):
             log.msg("Accepting mail for %s..." % user.dest.addrstr)
-            emit(catalog.SMTP_RECIPIENT_ACCEPTED_ENCRYPTED, user.dest.addrstr)
+            emit_async(catalog.SMTP_RECIPIENT_ACCEPTED_ENCRYPTED,
+                       user.dest.addrstr)
 
         def not_found(failure):
             failure.trap(KeyNotFound)
 
             # if key was not found, check config to see if will send anyway
             if self._encrypted_only:
-                emit(catalog.SMTP_RECIPIENT_REJECTED, user.dest.addrstr)
+                emit_async(catalog.SMTP_RECIPIENT_REJECTED, user.dest.addrstr)
                 raise smtp.SMTPBadRcpt(user.dest.addrstr)
             log.msg("Warning: will send an unencrypted message (because "
                     "encrypted_only' is set to False).")
-            emit(
+            emit_async(
                 catalog.SMTP_RECIPIENT_ACCEPTED_UNENCRYPTED,
                 user.dest.addrstr)
 
@@ -309,7 +307,7 @@ class EncryptedMessage(object):
         """
         log.msg("Connection lost unexpectedly!")
         log.err()
-        emit(catalog.SMTP_CONNECTION_LOST, self._user.dest.addrstr)
+        emit_async(catalog.SMTP_CONNECTION_LOST, self._user.dest.addrstr)
         # unexpected loss of connection; don't save
 
         self._lines = []

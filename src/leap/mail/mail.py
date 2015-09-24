@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # mail.py
-# Copyright (C) 2014 LEAP
+# Copyright (C) 2014,2015 LEAP
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,7 +15,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
-Generic Access to Mail objects: Public LEAP Mail API.
+Generic Access to Mail objects.
+
+This module holds the public LEAP Mail API, which should be viewed as the main
+entry point for message and account manipulation, in a protocol-agnostic way.
+
+In the future, pluggable transports will expose this generic API.
 """
 import itertools
 import uuid
@@ -28,7 +33,7 @@ from twisted.internet import defer
 from twisted.python import log
 
 from leap.common.check import leap_assert_type
-from leap.common.events import emit, catalog
+from leap.common.events import emit_async, catalog
 from leap.common.mail import get_email_charset
 
 from leap.mail.adaptors.soledad import SoledadMailAdaptor
@@ -148,6 +153,9 @@ class MessagePart(object):
     # TODO This class should be better abstracted from the data model.
     # TODO support arbitrarily nested multiparts (right now we only support
     #      the trivial case)
+    """
+    Represents a part of a multipart MIME Message.
+    """
 
     def __init__(self, part_map, cdocs={}, nested=False):
         """
@@ -736,8 +744,7 @@ class MessageCollection(object):
         :param unseen: number of unseen messages.
         :type unseen: int
         """
-        # TODO change name of the signal, independent from imap now.
-        emit(catalog.MAIL_UNREAD_MESSAGES, str(unseen))
+        emit_async(catalog.MAIL_UNREAD_MESSAGES, str(unseen))
 
     def copy_msg(self, msg, new_mbox_uuid):
         """
@@ -917,17 +924,19 @@ class Account(object):
 
     adaptor_class = SoledadMailAdaptor
 
-    # This is a mapping to collection instances so that we always
-    # return a reference to them instead of creating new ones. However, being a
-    # dictionary of weakrefs values, they automagically vanish from the dict
-    # when no hard refs is left to them (so they can be garbage collected)
-    # This is important because the different wrappers rely on several
-    # kinds of deferredLocks that are kept as class or instance variables
-    _collection_mapping = weakref.WeakValueDictionary()
-
     def __init__(self, store, ready_cb=None):
         self.store = store
         self.adaptor = self.adaptor_class()
+
+        # this is a mapping to collection instances so that we always
+        # return a reference to them instead of creating new ones. however,
+        # being a dictionary of weakrefs values, they automagically vanish
+        # from the dict when no hard refs is left to them (so they can be
+        # garbage collected) this is important because the different wrappers
+        # rely on several kinds of deferredlocks that are kept as class or
+        # instance variables
+        self._collection_mapping = weakref.WeakValueDictionary()
+
         self.mbox_indexer = MailboxIndexer(self.store)
 
         # This flag is only used from the imap service for the moment.

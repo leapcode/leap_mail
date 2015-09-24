@@ -30,12 +30,13 @@ from email.parser import Parser
 from mock import Mock
 from twisted.internet import defer
 
+from leap.keymanager.errors import KeyAddressMismatch
 from leap.keymanager.openpgp import OpenPGPKey
 from leap.mail.adaptors import soledad_indexes as fields
 from leap.mail.constants import INBOX_NAME
 from leap.mail.imap.account import IMAPAccount
 from leap.mail.incoming.service import IncomingMail
-from leap.mail.smtp.rfc3156 import MultipartEncrypted, PGPEncrypted
+from leap.mail.rfc3156 import MultipartEncrypted, PGPEncrypted
 from leap.mail.tests import (
     TestCaseWithKeyManager,
     ADDRESS,
@@ -154,9 +155,6 @@ subject: independence of cyberspace
         return d
 
     def testExtractAttachedKey(self):
-        """
-        Test the OpenPGP header key extraction
-        """
         KEY = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n..."
 
         message = MIMEMultipart()
@@ -166,7 +164,6 @@ subject: independence of cyberspace
         message.attach(key)
         self.fetcher._keymanager.put_raw_key = Mock(
             return_value=defer.succeed(None))
-        self.fetcher._keymanager.fetch_key = Mock()
 
         def put_raw_key_called(_):
             self.fetcher._keymanager.put_raw_key.assert_called_once_with(
@@ -176,8 +173,92 @@ subject: independence of cyberspace
         d.addCallback(put_raw_key_called)
         return d
 
+    def testExtractInvalidAttachedKey(self):
+        KEY = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n..."
+
+        message = MIMEMultipart()
+        message.add_header("from", ADDRESS_2)
+        key = MIMEApplication("", "pgp-keys")
+        key.set_payload(KEY)
+        message.attach(key)
+        self.fetcher._keymanager.put_raw_key = Mock(
+            return_value=defer.fail(KeyAddressMismatch()))
+
+        def put_raw_key_called(_):
+            self.fetcher._keymanager.put_raw_key.assert_called_once_with(
+                KEY, OpenPGPKey, address=ADDRESS_2)
+
+        d = self._do_fetch(message.as_string())
+        d.addCallback(put_raw_key_called)
+        return d
+
+    def testExtractAttachedKeyAndNotOpenPGPHeader(self):
+        KEY = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n..."
+        KEYURL = "https://leap.se/key.txt"
+        OpenPGP = "id=12345678; url=\"%s\"; preference=signencrypt" % (KEYURL,)
+
+        message = MIMEMultipart()
+        message.add_header("from", ADDRESS_2)
+        message.add_header("OpenPGP", OpenPGP)
+        key = MIMEApplication("", "pgp-keys")
+        key.set_payload(KEY)
+        message.attach(key)
+
+        self.fetcher._keymanager.put_raw_key = Mock(
+            return_value=defer.succeed(None))
+        self.fetcher._keymanager.fetch_key = Mock()
+
+        def put_raw_key_called(_):
+            self.fetcher._keymanager.put_raw_key.assert_called_once_with(
+                KEY, OpenPGPKey, address=ADDRESS_2)
+            self.assertFalse(self.fetcher._keymanager.fetch_key.called)
+
+        d = self._do_fetch(message.as_string())
+        d.addCallback(put_raw_key_called)
+        return d
+
+    def testExtractOpenPGPHeaderIfInvalidAttachedKey(self):
+        KEY = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n..."
+        KEYURL = "https://leap.se/key.txt"
+        OpenPGP = "id=12345678; url=\"%s\"; preference=signencrypt" % (KEYURL,)
+
+        message = MIMEMultipart()
+        message.add_header("from", ADDRESS_2)
+        message.add_header("OpenPGP", OpenPGP)
+        key = MIMEApplication("", "pgp-keys")
+        key.set_payload(KEY)
+        message.attach(key)
+
+        self.fetcher._keymanager.put_raw_key = Mock(
+            return_value=defer.fail(KeyAddressMismatch()))
+        self.fetcher._keymanager.fetch_key = Mock()
+
+        def put_raw_key_called(_):
+            self.fetcher._keymanager.put_raw_key.assert_called_once_with(
+                KEY, OpenPGPKey, address=ADDRESS_2)
+            self.fetcher._keymanager.fetch_key.assert_called_once_with(
+                ADDRESS_2, KEYURL, OpenPGPKey)
+
+        d = self._do_fetch(message.as_string())
+        d.addCallback(put_raw_key_called)
+        return d
+
+    def testAddDecryptedHeader(self):
+        class DummyMsg():
+            def __init__(self):
+                self.headers = {}
+
+            def add_header(self, k, v):
+                self.headers[k] = v
+
+        msg = DummyMsg()
+        self.fetcher._add_decrypted_header(msg)
+
+        self.assertEquals(msg.headers['X-Leap-Encryption'], 'decrypted')
+
     def testDecryptEmail(self):
         self.fetcher._decryption_error = Mock()
+        self.fetcher._add_decrypted_header = Mock()
 
         def create_encrypted_message(encstr):
             message = Parser().parsestr(self.EMAIL)
@@ -198,8 +279,12 @@ subject: independence of cyberspace
             return newmsg
 
         def decryption_error_not_called(_):
-            self.assertFalse(self.fetcher._decyption_error.called,
+            self.assertFalse(self.fetcher._decryption_error.called,
                              "There was some errors with decryption")
+
+        def add_decrypted_header_called(_):
+            self.assertTrue(self.fetcher._add_decrypted_header.called,
+                            "There was some errors with decryption")
 
         d = self._km.encrypt(
             self.EMAIL,
