@@ -1,9 +1,9 @@
-leap-mail (0.4.0~rc2) unstable; urgency=medium
+leap-mail (0.4.0) unstable; urgency=medium
 
-  * Update to 0.4.0rc2 release.
+  * Update to 0.4.0 release.
   * Update description to fix capitalization and short description
 
- -- Micah Anderson <micah@leap.se>  Tue, 01 Sep 2015 14:34:54 -0400
+ -- Micah Anderson <micah@leap.se>  Thu, 29 Oct 2015 12:14:09 -0400
 
 leap-mail (0.3.11.1) UNRELEASED; urgency=medium
 
