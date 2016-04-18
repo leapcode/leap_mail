@@ -29,6 +29,8 @@ import StringIO
 import time
 import weakref
 
+from collections import defaultdict
+
 from twisted.internet import defer
 from twisted.python import log
 
@@ -744,7 +746,7 @@ class MessageCollection(object):
         :param unseen: number of unseen messages.
         :type unseen: int
         """
-        emit_async(catalog.MAIL_UNREAD_MESSAGES, str(unseen))
+        emit_async(catalog.MAIL_UNREAD_MESSAGES, self.store.uuid, str(unseen))
 
     def copy_msg(self, msg, new_mbox_uuid):
         """
@@ -924,18 +926,25 @@ class Account(object):
 
     adaptor_class = SoledadMailAdaptor
 
-    def __init__(self, store, ready_cb=None):
-        self.store = store
-        self.adaptor = self.adaptor_class()
+    # this is a defaultdict, indexed by userid, that returns a
+    # WeakValueDictionary mapping to collection instances so that we always
+    # return a reference to them instead of creating new ones. however,
+    # being a dictionary of weakrefs values, they automagically vanish
+    # from the dict when no hard refs is left to them (so they can be
+    # garbage collected) this is important because the different wrappers
+    # rely on several kinds of deferredlocks that are kept as class or
+    # instance variables.
 
-        # this is a mapping to collection instances so that we always
-        # return a reference to them instead of creating new ones. however,
-        # being a dictionary of weakrefs values, they automagically vanish
-        # from the dict when no hard refs is left to them (so they can be
-        # garbage collected) this is important because the different wrappers
-        # rely on several kinds of deferredlocks that are kept as class or
-        # instance variables
-        self._collection_mapping = weakref.WeakValueDictionary()
+    # We need it to be a class property because we create more than one Account
+    # object in the current usage pattern (ie, one in the mail service, and
+    # another one in the IncomingMailService). When we move to a proper service
+    # tree we can let it be an instance attribute.
+    _collection_mapping = defaultdict(weakref.WeakValueDictionary)
+
+    def __init__(self, store, user_id, ready_cb=None):
+        self.store = store
+        self.user_id = user_id
+        self.adaptor = self.adaptor_class()
 
         self.mbox_indexer = MailboxIndexer(self.store)
 
@@ -1069,7 +1078,8 @@ class Account(object):
         :rtype: deferred
         :return: a deferred that will fire with a MessageCollection
         """
-        collection = self._collection_mapping.get(name, None)
+        collection = self._collection_mapping[self.user_id].get(
+            name, None)
         if collection:
             return defer.succeed(collection)
 
@@ -1077,7 +1087,7 @@ class Account(object):
         def get_collection_for_mailbox(mbox_wrapper):
             collection = MessageCollection(
                 self.adaptor, self.store, self.mbox_indexer, mbox_wrapper)
-            self._collection_mapping[name] = collection
+            self._collection_mapping[self.user_id][name] = collection
             return collection
 
         d = self.adaptor.get_or_create_mbox(self.store, name)

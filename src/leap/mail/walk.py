@@ -17,20 +17,19 @@
 """
 Utilities for walking along a message tree.
 """
-import os
-
-from pycryptopp.hash import sha256
+from cryptography.hazmat.backends.multibackend import MultiBackend
+from cryptography.hazmat.backends.openssl.backend import (
+    Backend as OpenSSLBackend)
+from cryptography.hazmat.primitives import hashes
 
 from leap.mail.utils import first
 
-DEBUG = os.environ.get("BITMASK_MAIL_DEBUG")
 
-if DEBUG:
-    def get_hash(s):
-        return sha256.SHA256(s).hexdigest()[:10]
-else:
-    def get_hash(s):
-        return sha256.SHA256(s).hexdigest()
+def get_hash(s):
+    backend = MultiBackend([OpenSSLBackend()])
+    digest = hashes.Hash(hashes.SHA256(), backend)
+    digest.update(s)
+    return digest.finalize().encode("hex").upper()
 
 
 """
@@ -92,7 +91,7 @@ def get_raw_docs(msg, parts):
     return (
         {
             "type": "cnt",  # type content they'll be
-            "raw": payload if not DEBUG else payload[:100],
+            "raw": payload,
             "phash": get_hash(payload),
             "content-disposition": first(headers.get(
                 'content-disposition', '').split(';')),
@@ -168,10 +167,6 @@ def walk_msg_tree(parts, body_phash=None):
     inner_headers = parts[1].get(HEADERS, None) if (
         len(parts) == 2) else None
 
-    if DEBUG:
-        print "parts vector: ", pv
-        print
-
     # wrappers vector
     def getwv(pv):
         return [
@@ -209,7 +204,6 @@ def walk_msg_tree(parts, body_phash=None):
             last_part = max(main_pmap.keys())
             main_pmap[last_part][PART_MAP] = {}
             for partind in range(len(pv) - 1):
-                print partind + 1, len(parts)
                 main_pmap[last_part][PART_MAP][partind] = parts[partind + 1]
 
     outer = parts[0]

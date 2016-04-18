@@ -24,7 +24,6 @@ import time
 import warnings
 
 from email.parser import Parser
-from email.generator import Generator
 from email.utils import parseaddr
 from email.utils import formatdate
 from StringIO import StringIO
@@ -43,6 +42,7 @@ from leap.common.mail import get_email_charset
 from leap.keymanager import errors as keymanager_errors
 from leap.keymanager.openpgp import OpenPGPKey
 from leap.mail.adaptors import soledad_indexes as fields
+from leap.mail.generator import Generator
 from leap.mail.utils import json_loads, empty
 from leap.soledad.client import Soledad
 from leap.soledad.common.crypto import ENC_SCHEME_KEY, ENC_JSON_KEY
@@ -233,7 +233,7 @@ class IncomingMail(Service):
             failure.trap(InvalidAuthTokenError)
             # if the token is invalid, send an event so the GUI can
             # disable mail and show an error message.
-            emit_async(catalog.SOLEDAD_INVALID_AUTH_TOKEN)
+            emit_async(catalog.SOLEDAD_INVALID_AUTH_TOKEN, self._userid)
 
         log.msg('FETCH: syncing soledad...')
         d = self._soledad.sync()
@@ -254,7 +254,7 @@ class IncomingMail(Service):
             num_mails = len(doclist) if doclist is not None else 0
             if num_mails != 0:
                 log.msg("there are %s mails" % (num_mails,))
-            emit_async(catalog.MAIL_FETCHED_INCOMING,
+            emit_async(catalog.MAIL_FETCHED_INCOMING, self._userid,
                        str(num_mails), str(fetched_ts))
             return doclist
 
@@ -262,7 +262,7 @@ class IncomingMail(Service):
         """
         Sends unread event to ui.
         """
-        emit_async(catalog.MAIL_UNREAD_MESSAGES,
+        emit_async(catalog.MAIL_UNREAD_MESSAGES, self._userid,
                    str(self._inbox_collection.count_unseen()))
 
     # process incoming mail.
@@ -286,7 +286,7 @@ class IncomingMail(Service):
         deferreds = []
         for index, doc in enumerate(doclist):
             logger.debug("processing doc %d of %d" % (index + 1, num_mails))
-            emit_async(catalog.MAIL_MSG_PROCESSING,
+            emit_async(catalog.MAIL_MSG_PROCESSING, self._userid,
                        str(index), str(num_mails))
 
             keys = doc.content.keys()
@@ -336,7 +336,8 @@ class IncomingMail(Service):
                 decrdata = ""
                 success = False
 
-            emit_async(catalog.MAIL_MSG_DECRYPTED, "1" if success else "0")
+            emit_async(catalog.MAIL_MSG_DECRYPTED, self._userid,
+                       "1" if success else "0")
             return self._process_decrypted_doc(doc, decrdata)
 
         d = self._keymanager.decrypt(
@@ -393,7 +394,7 @@ class IncomingMail(Service):
 
         # ok, this is an incoming message
         rawmsg = msg.get(self.CONTENT_KEY, None)
-        if not rawmsg:
+        if rawmsg is None:
             return ""
         return self._maybe_decrypt_msg(rawmsg)
 
@@ -439,6 +440,7 @@ class IncomingMail(Service):
 
         fromHeader = msg.get('from', None)
         senderAddress = None
+
         if (fromHeader is not None and
             (msg.get_content_type() == MULTIPART_ENCRYPTED or
              msg.get_content_type() == MULTIPART_SIGNED)):
@@ -459,12 +461,14 @@ class IncomingMail(Service):
                 decrmsg.add_header(
                     self.LEAP_SIGNATURE_HEADER,
                     self.LEAP_SIGNATURE_VALID,
-                    pubkey=signkey.key_id)
+                    pubkey=signkey.fingerprint)
             return decrmsg.as_string()
 
         if msg.get_content_type() == MULTIPART_ENCRYPTED:
             d = self._decrypt_multipart_encrypted_msg(
                 msg, encoding, senderAddress)
+        elif msg.get_content_type() == MULTIPART_SIGNED:
+            d = self._verify_signature_not_encrypted_msg(msg, senderAddress)
         else:
             d = self._maybe_decrypt_inline_encrypted_msg(
                 msg, encoding, senderAddress)
@@ -544,11 +548,8 @@ class IncomingMail(Service):
         :rtype: Deferred
         """
         log.msg('maybe decrypting inline encrypted msg')
-        # serialize the original message
-        buf = StringIO()
-        g = Generator(buf)
-        g.flatten(origmsg)
-        data = buf.getvalue()
+
+        data = self._serialize_msg(origmsg)
 
         def decrypted_data(res):
             decrdata, signkey = res
@@ -576,6 +577,46 @@ class IncomingMail(Service):
             d = defer.succeed((data, None))
         d.addCallback(encode_and_return)
         return d
+
+    def _verify_signature_not_encrypted_msg(self, origmsg, sender_address):
+        """
+        Possibly decrypt an inline OpenPGP encrypted message.
+
+        :param origmsg: The original, possibly encrypted message.
+        :type origmsg: Message
+        :param sender_address: The email address of the sender of the message.
+        :type sender_address: str
+
+        :return: A Deferred that will be fired with a tuple containing a
+        signed Message and the signing OpenPGPKey if the signature
+        is valid or InvalidSignature.
+        :rtype: Deferred
+        """
+        msg = copy.deepcopy(origmsg)
+        data = self._serialize_msg(msg.get_payload(0))
+        detached_sig = self._extract_signature(msg)
+        d = self._keymanager.verify(data, sender_address, OpenPGPKey,
+                                    detached_sig)
+
+        d.addCallback(lambda sign_key: (msg, sign_key))
+        d.addErrback(lambda _: (msg, keymanager_errors.InvalidSignature()))
+        return d
+
+    def _serialize_msg(self, origmsg):
+        buf = StringIO()
+        g = Generator(buf)
+        g.flatten(origmsg)
+        return buf.getvalue()
+
+    def _extract_signature(self, msg):
+        body = msg.get_payload(0).get_payload()
+
+        if isinstance(body, str):
+            body = msg.get_payload(0)
+
+        detached_sig = msg.get_payload(1).get_payload()
+        msg.set_payload(body)
+        return detached_sig
 
     def _decryption_error(self, failure, msg):
         """
@@ -708,7 +749,7 @@ class IncomingMail(Service):
         for attachment in attachments:
             if MIME_KEY == attachment.get_content_type():
                 d = self._keymanager.put_raw_key(
-                    attachment.get_payload(),
+                    attachment.get_payload(decode=True),
                     OpenPGPKey,
                     address=address)
                 d.addCallbacks(log_key_added, failed_put_key)
@@ -743,10 +784,11 @@ class IncomingMail(Service):
                 listener(result)
 
             def signal_deleted(doc_id):
-                emit_async(catalog.MAIL_MSG_DELETED_INCOMING)
+                emit_async(catalog.MAIL_MSG_DELETED_INCOMING,
+                           self._userid)
                 return doc_id
 
-            emit_async(catalog.MAIL_MSG_SAVED_LOCALLY)
+            emit_async(catalog.MAIL_MSG_SAVED_LOCALLY, self._userid)
             d = self._delete_incoming_message(doc)
             d.addCallback(signal_deleted)
             return d
