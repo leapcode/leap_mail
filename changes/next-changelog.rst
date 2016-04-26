@@ -1,0 +1,39 @@
+0.4.1 - xxx
++++++++++++++++++++++++++++++++
+
+Please add lines to this file, they will be moved to the CHANGELOG.rst during
+the next release.
+
+There are two template lines for each category, use them as reference.
+
+I've added a new category `Misc` so we can track doc/style/packaging stuff.
+
+Features
+~~~~~~~~
+- `#7656 <https://leap.se/code/issues/7656>`_: Emit multi-user aware events.
+- `#4008 <https://leap.se/code/issues/4008>`_: Add token-based authentication to local IMAP/SMTP services.
+- `#7889 <https://leap.se/code/issues/7889>`_: Use cryptography instead of pycryptopp to reduce dependencies.
+- `#7263 <https://leap.se/code/issues/7263>`_: Implement local bounces to notify user of SMTP delivery errors.
+- Use twisted.cred to authenticate IMAP users.
+
+- `#1234 <https://leap.se/code/issues/1234>`_: Description of the new feature corresponding with issue #1234.
+- New feature without related issue number.
+
+Bugfixes
+~~~~~~~~
+- `#7861 <https://leap.se/code/issues/7861>`_: Use the right succeed function for passthrough encrypted email.
+- `#7898 <https://leap.se/code/issues/7898>`_: Fix IMAP fetch headers
+- `#7977 <https://leap.se/code/issues/7977>`_: Decode attached keys so they are recognized by keymanager.
+- Fix the get_body logic for corner-cases in which body is None (yet-to-be synced docs, mainly).
+
+- `#1235 <https://leap.se/code/issues/1235>`_: Description for the fixed stuff corresponding with issue #1235.
+- Bugfix without related issue number.
+
+Misc
+~~~~
+- `#1236 <https://leap.se/code/issues/1236>`_: Description of the new feature corresponding with issue #1236.
+- Some change without issue number.
+
+Known Issues
+~~~~~~~~~~~~
+- `#1236 <https://leap.se/code/issues/1236>`_: Description of the known issue corresponding with issue #1236.

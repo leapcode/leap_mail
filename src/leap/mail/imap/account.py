@@ -49,6 +49,7 @@ if PROFILE_CMD:
 # Soledad IMAP Account
 #######################################
 
+
 class IMAPAccount(object):
     """
     An implementation of an imap4 Account
@@ -59,7 +60,7 @@ class IMAPAccount(object):
 
     selected = None
 
-    def __init__(self, user_id, store, d=defer.Deferred()):
+    def __init__(self, store, user_id, d=defer.Deferred()):
         """
         Keeps track of the mailboxes and subscriptions handled by this account.
 
@@ -68,12 +69,13 @@ class IMAPAccount(object):
         You can either pass a deferred to this constructor, or use
         `callWhenReady` method.
 
-        :param user_id: The name of the account (user id, in the form
-                        user@provider).
-        :type user_id: str
-
         :param store: a Soledad instance.
         :type store: Soledad
+
+        :param user_id: The identifier of the user this account belongs to
+                        (user id, in the form user@provider).
+        :type user_id: str
+
 
         :param d: a deferred that will be fired with this IMAPAccount instance
                   when the account is ready to be used.
@@ -87,7 +89,7 @@ class IMAPAccount(object):
         # about user_id, only the client backend.
 
         self.user_id = user_id
-        self.account = Account(store, ready_cb=lambda: d.callback(self))
+        self.account = Account(store, user_id, ready_cb=lambda: d.callback(self))
 
     def end_session(self):
         """

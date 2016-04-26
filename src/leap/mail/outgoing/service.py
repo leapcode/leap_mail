@@ -14,6 +14,14 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+"""
+OutgoingMail module.
+
+The OutgoingMail class allows to send mail, and encrypts/signs it if needed.
+"""
+
+import os.path
 import re
 from StringIO import StringIO
 from copy import deepcopy
@@ -35,6 +43,7 @@ from leap.common.events import emit_async, catalog
 from leap.keymanager.openpgp import OpenPGPKey
 from leap.keymanager.errors import KeyNotFound, KeyAddressMismatch
 from leap.mail import __version__
+from leap.mail import errors
 from leap.mail.utils import validate_address
 from leap.mail.rfc3156 import MultipartEncrypted
 from leap.mail.rfc3156 import MultipartSigned
@@ -64,14 +73,32 @@ class SSLContextFactory(ssl.ClientContextFactory):
         return ctx
 
 
-class OutgoingMail:
+def outgoingFactory(userid, keymanager, opts, check_cert=True, bouncer=None):
+
+    cert = unicode(opts.cert)
+    key = unicode(opts.key)
+    hostname = str(opts.hostname)
+    port = opts.port
+
+    if check_cert:
+        if not os.path.isfile(cert):
+            raise errors.ConfigurationError(
+                'No valid SMTP certificate could be found for %s!' % userid)
+
+    return OutgoingMail(
+        str(userid), keymanager, cert, key, hostname, port,
+        bouncer)
+
+
+class OutgoingMail(object):
     """
-    A service for handling encrypted outgoing mail.
+    Sends Outgoing Mail, encrypting and signing if needed.
     """
 
-    def __init__(self, from_address, keymanager, cert, key, host, port):
+    def __init__(self, from_address, keymanager, cert, key, host, port,
+                 bouncer=None):
         """
-        Initialize the mail service.
+        Initialize the outgoing mail service.
 
         :param from_address: The sender address.
         :type from_address: str
@@ -109,6 +136,7 @@ class OutgoingMail:
         self._cert = cert
         self._from_address = from_address
         self._keymanager = keymanager
+        self._bouncer = bouncer
 
     def send_message(self, raw, recipient):
         """
@@ -121,8 +149,8 @@ class OutgoingMail:
         :return: a deferred which delivers the message when fired
         """
         d = self._maybe_encrypt_and_sign(raw, recipient)
-        d.addCallback(self._route_msg)
-        d.addErrback(self.sendError)
+        d.addCallback(self._route_msg, raw)
+        d.addErrback(self.sendError, raw)
         return d
 
     def sendSuccess(self, smtp_sender_result):
@@ -134,23 +162,41 @@ class OutgoingMail:
         :type smtp_sender_result: tuple(int, list(tuple))
         """
         dest_addrstr = smtp_sender_result[1][0][0]
-        log.msg('Message sent to %s' % dest_addrstr)
-        emit_async(catalog.SMTP_SEND_MESSAGE_SUCCESS, dest_addrstr)
+        fromaddr = self._from_address
+        log.msg('Message sent from %s to %s' % (fromaddr, dest_addrstr))
+        emit_async(catalog.SMTP_SEND_MESSAGE_SUCCESS,
+                   fromaddr, dest_addrstr)
 
-    def sendError(self, failure):
+    def sendError(self, failure, origmsg):
         """
         Callback for an unsuccessfull send.
 
-        :param e: The result from the last errback.
-        :type e: anything
+        :param failure: The result from the last errback.
+        :type failure: anything
+        :param origmsg: the original, unencrypted, raw message, to be passed to
+                        the bouncer.
+        :type origmsg: str
         """
-        # XXX: need to get the address from the exception to send signal
-        # emit_async(catalog.SMTP_SEND_MESSAGE_ERROR, self._user.dest.addrstr)
+        # XXX: need to get the address from the original message to send signal
+        # emit_async(catalog.SMTP_SEND_MESSAGE_ERROR, self._from_address,
+        #   self._user.dest.addrstr)
+
+        # TODO when we implement outgoing queues/long-term-retries, we could
+        # examine the error *here* and delay the notification if it's just a
+        # temporal error. We might want to notify the permanent errors
+        # differently.
+
         err = failure.value
         log.err(err)
-        raise err
 
-    def _route_msg(self, encrypt_and_sign_result):
+        if self._bouncer:
+            self._bouncer.bounce_message(
+                err.message, to=self._from_address,
+                orig=origmsg)
+        else:
+            raise err
+
+    def _route_msg(self, encrypt_and_sign_result, raw):
         """
         Sends the msg using the ESMTPSenderFactory.
 
@@ -164,7 +210,8 @@ class OutgoingMail:
 
         # we construct a defer to pass to the ESMTPSenderFactory
         d = defer.Deferred()
-        d.addCallbacks(self.sendSuccess, self.sendError)
+        d.addCallback(self.sendSuccess)
+        d.addErrback(self.sendError, raw)
         # we don't pass an ssl context factory to the ESMTPSenderFactory
         # because ssl will be handled by reactor.connectSSL() below.
         factory = smtp.ESMTPSenderFactory(
@@ -178,7 +225,8 @@ class OutgoingMail:
             requireAuthentication=False,
             requireTransportSecurity=True)
         factory.domain = __version__
-        emit_async(catalog.SMTP_SEND_MESSAGE_START, recipient.dest.addrstr)
+        emit_async(catalog.SMTP_SEND_MESSAGE_START,
+                   self._from_address, recipient.dest.addrstr)
         reactor.connectSSL(
             self._host, self._port, factory,
             contextFactory=SSLContextFactory(self._cert, self._key))
@@ -226,7 +274,7 @@ class OutgoingMail:
         origmsg = Parser().parsestr(raw)
 
         if origmsg.get_content_type() == 'multipart/encrypted':
-            return defer.success((origmsg, recipient))
+            return defer.succeed((origmsg, recipient))
 
         from_address = validate_address(self._from_address)
         username, domain = from_address.split('@')
@@ -241,6 +289,7 @@ class OutgoingMail:
 
         def signal_encrypt_sign(newmsg):
             emit_async(catalog.SMTP_END_ENCRYPT_AND_SIGN,
+                       self._from_address,
                        "%s,%s" % (self._from_address, to_address))
             return newmsg, recipient
 
@@ -248,7 +297,7 @@ class OutgoingMail:
             failure.trap(KeyNotFound, KeyAddressMismatch)
 
             log.msg('Will send unencrypted message to %s.' % to_address)
-            emit_async(catalog.SMTP_START_SIGN, self._from_address)
+            emit_async(catalog.SMTP_START_SIGN, self._from_address, to_address)
             d = self._sign(message, from_address)
             d.addCallback(signal_sign)
             return d
@@ -260,6 +309,7 @@ class OutgoingMail:
         log.msg("Will encrypt the message with %s and sign with %s."
                 % (to_address, from_address))
         emit_async(catalog.SMTP_START_ENCRYPT_AND_SIGN,
+                   self._from_address,
                    "%s,%s" % (self._from_address, to_address))
         d = self._maybe_attach_key(origmsg, from_address, to_address)
         d.addCallback(maybe_encrypt_and_sign)
@@ -457,7 +507,7 @@ class OutgoingMail:
         def add_openpgp_header(signkey):
             username, domain = sign_address.split('@')
             newmsg.add_header(
-                'OpenPGP', 'id=%s' % signkey.key_id,
+                'OpenPGP', 'id=%s' % signkey.fingerprint,
                 url='https://%s/key/%s' % (domain, username),
                 preference='signencrypt')
             return newmsg, origmsg
