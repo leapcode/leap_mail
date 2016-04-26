@@ -99,7 +99,8 @@ def get_versions(default={}, verbose=False):
         subst_template = self.template.format(
             version=VERSION_SHORT,
             full_revisionid=VERSION_REVISION) + self.templatefun
-        with open(versioneer.versionfile_source, 'w') as f:
+        versioneer_cfg = versioneer.get_config_from_root('.')
+        with open(versioneer_cfg.versionfile_source, 'w') as f:
             f.write(subst_template)
 
 
