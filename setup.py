@@ -98,7 +98,7 @@ def get_versions(default={}, verbose=False):
             return
         subst_template = self.template.format(
             version=VERSION_SHORT,
-            version_full=VERSION_REVISION) + self.templatefun
+            full_revisionid=VERSION_REVISION) + self.templatefun
         with open(versioneer.versionfile_source, 'w') as f:
             f.write(subst_template)
 
@@ -136,7 +136,7 @@ setup(
     maintainer_email='kali@leap.se',
     description='Mail Services provided by Bitmask, the LEAP Client.',
     long_description=open('README.rst').read() + '\n\n\n' +
-    open('CHANGELOG').read(),
+    open('CHANGELOG.rst').read(),
     classifiers=trove_classifiers,
     namespace_packages=["leap"],
     package_dir={'': 'src'},
