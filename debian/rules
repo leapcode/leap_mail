@@ -7,5 +7,5 @@
 	dh $@ --with python2 --buildsystem=python_distutils
 
 override_dh_installchangelogs:
-	dh_installchangelogs CHANGELOG
+	dh_installchangelogs CHANGELOG.rst
 
