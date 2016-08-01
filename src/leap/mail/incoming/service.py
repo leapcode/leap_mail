@@ -459,6 +459,7 @@ class IncomingMail(Service):
                                                     signkey.fingerprint)
             return decrmsg.as_string()
 
+        self._remove_headers(msg)
         if msg.get_content_type() == MULTIPART_ENCRYPTED:
             d = self._decrypt_multipart_encrypted_msg(
                 msg, encoding, senderAddress)
@@ -479,6 +480,10 @@ class IncomingMail(Service):
     def _add_decrypted_header(self, msg):
         msg.add_header(self.LEAP_ENCRYPTION_HEADER,
                        self.LEAP_ENCRYPTION_DECRYPTED)
+
+    def _remove_headers(self, msg):
+        del msg[self.LEAP_ENCRYPTION_HEADER]
+        del msg[self.LEAP_SIGNATURE_HEADER]
 
     def _decrypt_multipart_encrypted_msg(self, msg, encoding, senderAddress):
         """

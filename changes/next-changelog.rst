@@ -11,6 +11,7 @@ I've added a new category `Misc` so we can track doc/style/packaging stuff.
 Features
 ~~~~~~~~
 - `#8031 <https://leap.se/code/issues/8031>`_: Adapt to the new KeyManager API without key types.
+- `#7429 <https://leap.se/code/issues/7429>`_: Remove senders X-Leap-* headers if the email came with them.
 
 - `#1234 <https://leap.se/code/issues/1234>`_: Description of the new feature corresponding with issue #1234.
 - New feature without related issue number.
